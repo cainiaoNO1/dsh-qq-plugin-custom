@@ -1,0 +1,2208 @@
+# 改造 1,2,3,4,5,6,7,8,9,12 | 文件: lib/runtime.js
+# 基线: dsh-qq-plugin@1.0.3
+warning: in the working copy of 'C:/Users/yuanmingjie/AppData/Local/Temp/upstream-qq/package/lib/runtime.js', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'C:/Users/yuanmingjie/.dsh/profiles/web/node_modules/dsh-qq-plugin/lib/runtime.js', LF will be replaced by CRLF the next time Git touches it
+diff --git a/lib/runtime.js b/lib/runtime.js
+index cb9b59e..662ca0f 100644
+--- a/lib/runtime.js
++++ b/lib/runtime.js
+@@ -41,8 +41,9 @@ import {
+   queuePendingNotification,
+ } from './pending.js'
+ import { longReplyFileName, planReply } from './reply-limit.js'
++import { hasMarkdown, markdownToPlain } from './plain-text.js'
+ import { resolveWorkspaceDir } from './paths.js'
+-import { SessionRouter, compareSessionsNewestFirst } from './router.js'
++import { SessionRouter, compareSessionsNewestFirst, mintSessionId, relativeTime, shortId } from './router.js'
+ import { mediaKindFor, notifyQqToolDefinition, sendToQqToolDefinition } from './send-tools.js'
+ import {
+   TOOL_NAME,
+@@ -56,6 +57,7 @@ import {
+   isSameWorkspace,
+   listAllStoredSessions,
+   listStoredSessions,
++  readStoredSessionDetails,
+   storedSessionWorkspace,
+ } from './session-index.js'
+ import { readStreamFrame } from './stream-frame.js'
+@@ -99,6 +101,188 @@ const TYPING_MAX_MS = 30 * 60 * 1000
+ /** 错误环形缓冲上限。 */
+ const MAX_ERRORS = 50
+ 
++/**
++ * 完成推送里，提问与结果之间的分隔线：**20 个连续的 `-`**。
++ *
++ * 用户明确要求这个形状。用固定串而不是 `'-'.repeat(20)` 散落各处，
++ * 是为了让"改分隔线"只有一处要改，且测试能钉住它。
++ */
++const FINISH_SEPARATOR = '-'.repeat(20)
++
++/**
++ * 把一段提问压成推送里那一行。
++ *
++ * 取**第一行非空内容**再截断：用户的原话里可能有换行与附件描述，
++ * 整段塞进去会把"提问 / 分隔线 / 结果"这个三段式撑坏。
++ *
++ * @param text - 用户原话。
++ * @param limit - 最多多少字；`<= 0` 表示不显示。
++ * @returns 一行提问，可能为空串（不显示）。
++ */
++function clipQuestion(text, limit) {
++  if (limit <= 0) return ''
++  const line = firstLine(text)
++  if (line === '') return ''
++  return line.length > limit ? `${line.slice(0, limit)}…` : line
++}
++
++/**
++ * 把一个目录路径压成"工作区名"——取最后一段。
++ *
++ * `/run` 的第一行要的是"哪个项目"，完整路径在手机上会长到折行，
++ * 反而看不出是哪几个任务。取末段正好是用户给那个目录起的名字。
++ *
++ * @param path - 绝对路径。
++ * @returns 末段；路径异常时返回原样。
++ */
++function workspaceName(path) {
++  if (typeof path !== 'string' || path === '') return '未知工作区'
++  const parts = path.split(/[\\/]/).filter((part) => part !== '')
++  return parts.length === 0 ? path : parts[parts.length - 1]
++}
++
++/**
++ * 把毫秒数说成人话（`12 分 30 秒`）。
++ *
++ * 只保留最大的两级单位：`1 小时 5 分` 足够，`1 小时 5 分 12 秒 340 毫秒` 在手机上是噪音。
++ *
++ * @param ms - 毫秒。
++ * @returns 可读时长。
++ */
++function formatDuration(ms) {
++  const total = Math.max(0, Math.floor(ms / 1000))
++  const days = Math.floor(total / 86_400)
++  const hours = Math.floor((total % 86_400) / 3_600)
++  const minutes = Math.floor((total % 3_600) / 60)
++  const seconds = total % 60
++  if (days > 0) return hours > 0 ? `${String(days)} 天 ${String(hours)} 小时` : `${String(days)} 天`
++  if (hours > 0) return minutes > 0 ? `${String(hours)} 小时 ${String(minutes)} 分` : `${String(hours)} 小时`
++  if (minutes > 0) return seconds > 0 ? `${String(minutes)} 分 ${String(seconds)} 秒` : `${String(minutes)} 分`
++  return `${String(seconds)} 秒`
++}
++
++/**
++ * 取一段文本的第一行非空内容。
++ *
++ * `/run` 的第三行只放一句提问——用户的原话里可能有换行和附件描述，
++ * 整段塞进去会把"一条三行"的格式撑坏。
++ *
++ * @param text - 原文。
++ * @returns 第一行非空内容，可能为空串。
++ */
++function firstLine(text, maxChars = 60) {
++  if (typeof text !== 'string') return ''
++  for (const line of text.split('\n')) {
++    const trimmed = line.trim()
++    if (trimmed !== '') return trimmed.length > maxChars ? `${trimmed.slice(0, maxChars)}…` : trimmed
++  }
++  return ''
++}
++
++/**
++ * 从一段文本里认出快捷触发词（`111` / `rrr`），并把它剥掉。
++ *
++ * ## 为什么不能只认"开头 + 空格"
++ *
++ * 真实故障：用户想发「111190.254，132.231 两个服务器已经回收了」，
++ * 三个 1 与内容之间**没有空格**，于是旧规则 `/^111(?:\s|$)/` 一个都没匹配上——
++ * 那条消息被当成普通聊天发进了当前会话，快捷通道毫无反应。
++ * 用户另一条消息把 `111` 放在了**结尾**，同样没被认出来。
++ *
++ * ## 只认**边界**，不认句子中间
++ *
++ * | 写法 | 结果 |
++ * |---|---|
++ * | `111 你好` | 触发，正文「你好」 |
++ * | `111你好` | 触发（紧贴也算），正文「你好」 |
++ * | `111190.254，…` | 触发，正文「190.254，…」 |
++ * | `你好 111` | 触发（结尾也算），正文「你好」 |
++ * | `第 111 行有问题` | **不触发**——111 在句子中间，那是内容 |
++ * | `算一下 111 乘以 3` | **不触发**，同上 |
++ * | `1111` / `111.5` | **不触发**——那是数量 |
++ *
++ * 中间不认是有意的：`111` 出现在句子中段时（「第 111 行」），
++ * 把它当命令剥掉会**吃掉用户的内容**，而那比"少触发一次"糟得多。
++ * 用户真正会用的两种写法——开头贴一个、结尾补一个——都认。
++ *
++ * ## 纯数字保护
++ *
++ * `111` 之后紧跟数字时（`1111`、`111.5`、`111190`），纯靠前缀分不清
++ * "快捷前缀 + 内容"与"一个数字"。所以这里加一条：**首词整体是纯数字/小数**
++ * 且不是恰好等于触发词时，判定为数量而不是前缀。
++ * `111190.254，132.231` 里带逗号，不是纯数字，于是照样触发——这正是用户要的那条。
++ *
++ * @param text - 用户原文。
++ * @param word - 触发词（`111` 或 `rrr`）。
++ * @returns 剥掉触发词后的正文；不是触发时 `undefined`。
++ */
++function extractTriggerWord(text, word, options = {}) {
++  const { allowMiddle = false } = options
++  const trimmed = typeof text === 'string' ? text.trim() : ''
++  if (trimmed === '' || !trimmed.includes(word)) return undefined
++
++  /*
++   * 整条就是触发词的重复（`1111`、`rrrr`）：那不是命令，是一个词。
++   * 纯数字那条已经挡住 `1111`，这里再挡住 `rrrr` 这类。
++   */
++  const repeated = new RegExp(`^${word[0] === '1' ? '1' : word[0]}+$`)
++  if (repeated.test(trimmed) && trimmed !== word) return undefined
++
++  /*
++   * 纯数字保护：只看**首词**。`1111` 的首词是 `1111`（纯数字，且不等于 `111`）→ 不是前缀。
++   * `rrr` 是字母，这条对它天然不成立（`/^[\d.]+$/` 不会命中）。
++   */
++  const firstToken = trimmed.split(/\s/)[0] ?? ''
++  if (firstToken !== word && /^[\d.]+$/.test(firstToken)) return undefined
++
++  const leading = new RegExp(`^${word}`)
++  const trailing = new RegExp(`(?:^|\\s)${word}$`)
++  /*
++   * 句中**独立成词**（两侧都是空白）的位置。
++   *
++   * 只有 `rrr` 允许这一条：字母词出现在句中（`//i rrr 要做的事`）几乎没有歧义，
++   * 而 `111` 出现在句中常常是内容本身（「第 111 行」），剥掉会吃掉用户的话。
++   */
++  const middle = new RegExp(`(?:^|\\s)${word}(?=\\s|$)`)
++
++  const hasLeading = leading.test(trimmed)
++  const hasTrailing = trailing.test(trimmed)
++  const hasMiddle = allowMiddle && middle.test(trimmed)
++  if (!hasLeading && !hasTrailing && !hasMiddle) return undefined
++
++  let body = trimmed
++  if (hasLeading) body = body.replace(leading, ' ')
++  if (hasTrailing) body = body.replace(trailing, ' ')
++  if (hasMiddle) body = body.replace(middle, ' ')
++  body = body.replace(/\s+/g, ' ').trim()
++  /*
++   * 剥掉残留的**斜杠指令前缀**（`/i`、`/help` 之类）。
++   *
++   * 场景：`//i rrr 要做的事` —— 剥掉 `//` 一层得到 `/i rrr 要做的事`，
++   * 再剥掉 `rrr` 只剩 `/i 要做的事`。那个 `/i` 是给 DSH 的技能手势，
++   * 不该跟着正文一起发给目标会话（目标会话收到 `/i` 会去找一个叫 i 的技能，
++   * 而用户的意图是"开启 ADHD 模式 + 转达要求"两件事）。
++   *
++   * 只在**正文里只剩下指令词**时剥：`/i 要做的事` → `要做的事`。
++   * 正文本身以 `/` 开头但不是已知指令形态时（`/usr/bin`）不动。
++   */
++  const loneCommand = /^\/([a-z][a-z0-9-]*)\s+([\s\S]+)$/i.exec(body)
++  if (loneCommand !== null) body = loneCommand[2].trim()
++  return body
++}
++
++/**
++ * `/notify` 指令接受的"开"与"关"词表。
++ *
++ * 中英文都收，因为用户在手机上可能用任一语言；`1`/`0` 收是因为
++ * 设置页显示的就是布尔，而有人习惯用数字表达。
++ *
++ * 这两个集合同时充当"无分隔符写法的白名单"（见 `#handleNotifyCommand`）：
++ * 只有整体落在其中一个里，`/notifyon` 才被认成指令，`/notifications` 不会。
++ */
++const ON_WORDS = new Set(['on', '1', '开', '开启', '打开', 'true', 'yes'])
++const OFF_WORDS = new Set(['off', '0', '关', '关闭', 'false', 'no'])
++
+ /**
+  * 安全地读一个可选服务。
+  *
+@@ -207,6 +391,13 @@ export class QqRuntime {
+   #appId
+   /** sessionId → 待发回复。 */
+   #replies = new Map()
++  /**
++   * sessionId → 未绑定会话的待发结果（`notifyAllSessions` 用）。
++   *
++   * 与 `#replies` 分开的理由见 `#forwardUnbound`：绑定会话与未绑定会话可能同时
++   * 在跑，共用一张表会让两边的旁白区互相污染。
++   */
++  #unboundReplies = new Map()
+   /** conversationId → 最近一条入站消息（用于被动回复）。 */
+   #lastInbound = new Map()
+   /** 被动回复限流：SDK 默认每条消息最多 4 次、1 小时窗口（平台规则是 60 分钟内 5 次，插件没有改默认值）。 */
+@@ -215,9 +406,33 @@ export class QqRuntime {
+   #typing = new Map()
+   /** 诊断去重桶。 */
+   #seen = new Set()
++  /**
++   * 上一次保存设置时**本版本不认识**的字段名。
++   *
++   * 只在"页面与宿主版本不一致"时非空（见 `applySettings`）。留着它是为了让
++   * `settingsForPage()` 能把它回传给设置页——用户需要看到"这个字段没生效"，
++   * 而不是一条「已保存」。
++   */
++  #ignoredSettings = []
+   #errors = []
+   /** 已处理的入站消息 id（去重）。 */
+   #handledMessages = new Set()
++  /**
++   * sessionId → `{ startedAt, prompt }`：**这一轮是什么时候开始的、问的是什么**。
++   *
++   * `/run` 要用它回答"跑了多久"和"在跑什么"，而宿主的两样东西都给不全：
++   *
++   * - `sessionController.list()` 只给 `running: true/false` 与 `updatedAt`
++   *   （后者是**最后一次写入**的时间，不等于回合开始时间）；
++   * - 回合开始时间藏在会话事件流的 `turn/start` 里，读它要按会话去翻日志，
++   *   每查一次 `/run` 就把所有会话的历史读一遍，代价与收益不成比例。
++   *
++   * 所以这里在**提交提示词那一刻**记下时间与内容。代价是：插件启动之前就已经在跑的
++   * 会话没有记录（那种情况下面显示"开始时间未知"，而不是编一个数）。
++   *
++   * 只放内存：它是瞬时状态，重启后 `running` 本身也归零，持久化没有意义。
++   */
++  #runningSince = new Map()
+   /**
+    * 全部设置项（**一个对象，九个字段**）。
+    *
+@@ -781,7 +996,15 @@ export class QqRuntime {
+       settings[key] = this.#settings[key]
+       defaults[key] = SETTINGS_DEFAULTS[key]
+     }
+-    return { settings, defaults }
++    /*
++     * `unknown` 是**上一次保存时被忽略的字段名**，随每次读回一起交出去。
++     *
++     * 为什么要回传而不是只在日志里写一行：设置页拿到它才能当场提示
++     * "这个字段没被接受"，否则用户看到的仍然是「已保存」——
++     * 而那正是这次真实故障的样子（页面比宿主新，字段被静默丢弃）。
++     * 正常情况下它是空数组，页面不需要做任何事。
++     */
++    return { settings, defaults, unknown: [...this.#ignoredSettings] }
+   }
+ 
+   /**
+@@ -815,6 +1038,23 @@ export class QqRuntime {
+        */
+       this.#settings.workspacePath = this.#settings.workspacePath.trim()
+       this.#switchWorkspace(this.#settings.workspacePath)
++      /*
++       * 快速对话目录：读回时同样 trim，并把目录建出来（`resolveWorkspaceDir` 会 mkdir）。
++       *
++       * 这里**不切工作区**——它是一条旁路，本频道的 cwd 不受影响。
++       * 建不出来只记一行：`111` 真正到来时会回退成普通文本并告诉用户原因，
++       * 而这里抛错会把整个渠道的启动带下去。
++       */
++      this.#settings.quickWorkspacePath = this.#settings.quickWorkspacePath.trim()
++      if (this.#settings.quickWorkspacePath !== '') {
++        const quickResolved = resolveWorkspaceDir(this.#home, this.#settings.quickWorkspacePath)
++        if (quickResolved.fellBack) {
++          bootLog(`快速对话目录不可用：${String(quickResolved.reason)}（111 将按普通文本处理）`)
++          this.#recordError(`快速对话目录不可用：${String(quickResolved.reason)}`)
++        } else {
++          bootLog(`快速对话目录：${quickResolved.path}`)
++        }
++      }
+       bootLog(
+         `设置已读回：preset=${this.#settings.permissionPreset} confirm=${String(this.#settings.requireConfirmation)} ` +
+           `crossNotify=${String(this.#settings.allowCrossSessionNotify)} settle=${String(this.#settings.settleMs)}`,
+@@ -879,6 +1119,27 @@ export class QqRuntime {
+     const requested = []
+     /** 请求带了、但校验不过因此被丢弃的字段（"发了没收下"的那一类）。 */
+     const dropped = []
++    /*
++     * ★ 本地扩展：请求里带了**本版本不认识的**字段名。
++     *
++     * ## 为什么必须单独报出来
++     *
++     * 真实故障：设置页（浏览器缓存的旧 `client.js`）提交了 `quickWorkspacePath`，
++     * 而当时宿主还没有这个键——循环只遍历 `SETTINGS_KEYS`，表外的键**被静默忽略**，
++     * 日志里连一个字都没有。用户看到的是"保存成功"，而那个值从来没进过状态文件。
++     *
++     * 两种版本不一致（页面比宿主新、或宿主比页面新）都会长这个样子，而它**无法从
++     * `state.json` 反推**：文件里只有"现在存的是什么"，说不出"刚才有人想存别的东西"。
++     *
++     * 所以这里把它挑出来，下面既写日志、也**回传给调用方**——设置页据此提示用户
++     * "这个字段没被接受"，而不是继续显示"已保存"。
++     */
++    const unknown = []
++    for (const key of Object.keys(patch ?? {})) {
++      if (!SETTINGS_KEYS.includes(key)) unknown.push(key)
++    }
++    // 记下供 `settingsForPage()` 回传；一次保存覆盖一次，不留陈旧值。
++    this.#ignoredSettings = unknown
+     for (const key of SETTINGS_KEYS) {
+       if (!Object.prototype.hasOwnProperty.call(patch ?? {}, key)) continue
+       requested.push(key)
+@@ -898,6 +1159,24 @@ export class QqRuntime {
+          */
+         this.#settings.workspacePath = normalized.trim()
+         this.#switchWorkspace(this.#settings.workspacePath)
++      } else if (key === 'quickWorkspacePath') {
++        /*
++         * 快速对话目录：空串 = 不启用（不是"用默认"）。
++         *
++         * 保存时就把目录**建出来**（`resolveWorkspaceDir` 内部 mkdir + 写探针），
++         * 这样第一条 `111` 不必先撞一次 ENOENT。建不出来只是"没生效"——
++         * 它会回落，而回落理由在真正用到 `111` 时才回报给用户，不在这里抛。
++         */
++        this.#settings.quickWorkspacePath = normalized.trim()
++        if (this.#settings.quickWorkspacePath !== '') {
++          const resolved = resolveWorkspaceDir(this.#home, this.#settings.quickWorkspacePath)
++          if (resolved.fellBack) {
++            bootLog(`快速对话目录不可用：${String(resolved.reason)}（111 将按普通文本处理）`)
++            this.#recordError(`快速对话目录不可用：${String(resolved.reason)}`)
++          } else {
++            bootLog(`快速对话目录已就绪：${resolved.path}`)
++          }
++        }
+       } else {
+         this.#settings[key] = normalized
+       }
+@@ -922,6 +1201,19 @@ export class QqRuntime {
+         ? `${pair}（请求 ${formatSettingValue(patch?.[key])}，被丢弃，保持原值）`
+         : pair
+     })
++    /*
++     * 未知字段单独记一行，而且**不并进上面那条**：它说明的是"版本对不上"，
++     * 与"值不合法"是两种完全不同的故障，混在一行里会被当成后者。
++     */
++    if (unknown.length > 0) {
++      bootLog(
++        `设置已忽略：请求里有本版本不认识的字段 ${unknown.join(', ')}——` +
++          '设置页与宿主版本可能不一致，请刷新页面（Ctrl+Shift+R）后重试',
++      )
++      this.#recordError(
++        `设置页提交了未知字段：${unknown.join(', ')}（页面与宿主版本不一致，请刷新页面）`,
++      )
++    }
+     bootLog(
+       changes.length === 0
+         ? '设置已存档：请求里没有可用的设置字段——什么也没改'
+@@ -1305,8 +1597,127 @@ export class QqRuntime {
+    *
+    * @param params.quoted - 被引用消息的正文；只交给路由（它靠它认出被引的那一屏清单），
+    *   交付给 agent 时按原来的顺序拼回正文之前。
++   * @param params.parkedAuto - 这条是**附件停靠窗口到期**自动投递的（用户没在说话）。
++   *   为真时即使目标会话正忙也**不弹忙时抉择**，直接排队——
++   *   那个提示问的是"你说的这句话怎么办"，而自动投递时压根没有"这句话"。
+    */
+-  async #deliverPrompt({ conversationId, accountId, peerId, text, attachmentLines, quoted }) {
++  async #deliverPrompt({
++    conversationId,
++    accountId,
++    peerId,
++    text,
++    attachmentLines,
++    quoted,
++    parkedAuto = false,
++  }) {
++    /*
++     * ★ 本地扩展：`/notify` 指令，在路由之前拦截。
++     *
++     * 为什么在这里而不在 `router.js`：路由不持有设置（它只有 `#gateway`，见那里的注释），
++     * 而读写这个开关需要运行时。放在这里等于"一份实现、一个入口"，
++     * 且不影响路由"指令要么回话、要么给提示词"的两分法。
++     */
++    const notifyReply = await this.#handleNotifyCommand(text)
++    if (notifyReply !== undefined) {
++      await this.#send(conversationId, notifyReply)
++      return
++    }
++
++    /*
++     * `/run`：列出正在跑的任务。
++     *
++     * 同样抢在路由之前——路由的 `default` 分支会把未知 `/` 指令当成
++     * 「未知指令」吞掉，`/run` 永远到不了这里。
++     */
++    const runReply = await this.#handleRunCommand(text, conversationId)
++    if (runReply !== undefined) {
++      await this.#send(conversationId, runReply)
++      return
++    }
++
++    /*
++     * ★ 本地扩展：先看这条消息是不是在回答"目标会话正忙，你要怎么办"。
++     *
++     * 必须排在**所有**其它分支之前（包括 `//` 转义和 `111`）：
++     * 用户此刻眼前的是一条带 1/2/3/0 的提示，他回的就是那个数字。
++     * 若让 `111` 之类的规则先跑，用户回一个 `1` 时插件会去找快速目录——
++     * 而他的意思明明是"插入到那个正在跑的会话里"。
++     */
++    const busyChoice = await this.#handleBusyChoice(conversationId, peerId, text)
++    if (busyChoice === true) return
++
++    /*
++     * ★ 本地扩展：`//x` 转义，以及 `111` 快速通道。
++     *
++     * 两者都在**路由之前**拦截，因为它们的语义都优先于插件自己的指令解析：
++     *
++     * - `//i` → 去掉一个斜杠得到 `/i`，**直接交给 agent**（DSH 认作 skill 手势）。
++     *   不能只改文本再交回路由：路由见到 `/` 就走 `#command`，而它的 `default`
++     *   分支会回一句「未知指令 /i」并吞掉消息——那正是要绕开的东西。
++     * - `111 x` → 发到「快速对话」目录的最新会话，**不动当前绑定**。
++     *   必须早于路由的浏览编号判定，否则刚看过 `/list` 时 `111` 会被当成编号。
++     */
++    const escaped = this.#unescapeSlashCommand(text)
++    if (escaped !== undefined) {
++      /*
++       * ★ 转义出来的文本**仍然要过一遍触发词**。
++       *
++       * 真实故障：用户发「//i rrr 要等添加过滤条件…」，想同时开 ADHD 模式
++       * 并把要求转给上一个跑完的会话。旧实现里 `//` 一转义就整条交给当前会话，
++       * `rrr` 一次都没被检查——用户看到的是"没能识别三个 r"。
++       *
++       * 顺序是有意的：先认转义（那是明确的"我要发这个"），
++       * 再从剥完的结果里认触发词。于是 `//i rrr x` 的语义是
++       * "把 `/i rrr x` 当作指令处理" → 里面还有 `rrr` → 转给上一个会话。
++       */
++      const innerRrr = await this.#handleFinishedReply(conversationId, peerId, escaped)
++      if (innerRrr === true) return
++      const innerQuick = await this.#handleQuickChannel(conversationId, peerId, escaped)
++      if (innerQuick === true) return
++
++      // 没有触发词：转义出来的命令**跳过路由**，作为普通提示词交给当前绑定会话。
++      await this.#deliverToBound(conversationId, accountId, peerId, escaped, attachmentLines)
++      return
++    }
++
++    /*
++     * `/111 x`：**字面发送**「111 x」给当前绑定会话（用户定义的转义写法）。
++     *
++     * 为什么必须在这里拦：`/111` 以单斜杠开头，会落进路由的 `#command`，
++     * 而它的 `default` 分支回一句「未知指令 /111」并吞掉消息——
++     * 于是"字面发送 111"这个约定根本执行不了。
++     */
++    const literal111 = this.#unescapeLiteral111(text)
++    if (literal111 !== undefined) {
++      await this.#deliverToBound(conversationId, accountId, peerId, literal111, attachmentLines)
++      return
++    }
++
++    /*
++     * `/rrr x`：**字面发送**「rrr x」给当前绑定会话（与 `/111` 同一种转义）。
++     *
++     * 同样必须抢在路由之前：`/rrr` 会落进 `#command` 的 `default`，
++     * 被当成未知指令吞掉。
++     */
++    const literalRrr = this.#unescapeLiteralRrr(text)
++    if (literalRrr !== undefined) {
++      await this.#deliverToBound(conversationId, accountId, peerId, literalRrr, attachmentLines)
++      return
++    }
++
++    /*
++     * `rrr x`：回话给**最近跑完任务**的那个会话。
++     *
++     * 与 `111` 的区别：`111` 去固定的「快速对话目录」，`rrr` 去**刚推送过结果的那个会话**——
++     * 用户看到一条"任务完成"的推送，想接着说一句，`rrr` 就是那个"接着说"。
++     * 同样**不动当前绑定**。
++     */
++    const replyRrr = await this.#handleFinishedReply(conversationId, peerId, text)
++    if (replyRrr === true) return
++
++    const quick = await this.#handleQuickChannel(conversationId, peerId, text)
++    if (quick === true) return
++
+     // 交给路由：它要么直接回一句（指令），要么给出该交给哪个会话的提示词。
+     // 与微信插件同构——`/new` `/list` `/switch` `/current` `/cancel` `/help` 都在路由里实现，
+     // 本运行时只负责传输。
+@@ -1327,6 +1738,13 @@ export class QqRuntime {
+        */
+       if (await this.#send(conversationId, routed.text)) {
+         await this.#router.delivered(conversationId, routed)
++        /*
++         * ★ 本地扩展：切换类指令成功后，把目标会话的**最后一次提问**补发一条。
++         *
++         * 切过去之后手机上是一片空白（历史在电脑上），用户不知道这个会话在干什么。
++         * 贴出最后一次提问，等于给这条对话一个可见的开头。
++         */
++        await this.#sendLastPromptIfSwitched(conversationId, routed.text)
+       }
+       return
+     }
+@@ -1379,6 +1797,35 @@ export class QqRuntime {
+ 
+     const outbound = composeDelivery({ promptText, attachmentLines, note })
+ 
++    /*
++     * 目标会话正在跑任务时，先问用户怎么办（插入/排队/分叉/撤回）。
++     *
++     * 原来的做法是"先 steer、被拒再 queue"——默认用户想插话。
++     * 但 steer 会打断正在跑的多步任务，让它偏离原计划，而这个代价不可逆。
++     * 所以这里交给用户当场决定，而不是替他猜。
++     *
++     * ⚠️ 两种情况下**不问**：
++     *
++     * 1. `parkedAuto`：附件停靠窗口到期自动投递的，用户此刻没有在说话，
++     *    弹"这句话要怎么处理"问的是一个不存在的东西。
++     * 2. **只有附件、没有文字**：用户发来一张图，没有任何"这句话"。
++     *    真实故障——用户发图后立刻看到四选一提示，而他能选的只有
++     *    "把这张图插进去还是排队"，那不是他想回答的问题。
++     *    这种情况直接排队，图会照常送达。
++     */
++    const hasUserText = promptText.trim() !== ''
++    const shouldAsk = !parkedAuto && hasUserText
++    if (shouldAsk && (await this.#isSessionRunning(routed.decision.sessionId))) {
++      this.#stopTyping(conversationId)
++      await this.#askBusyChoice(
++        conversationId,
++        routed.decision.sessionId,
++        outbound.join('\n\n'),
++        'bound',
++      )
++      return
++    }
++
+     let accepted = false
+     for (const part of outbound) {
+       // 被拒的 steer 是一个真实结果（它瞄准的那个回合可能刚好结束），所以退到队列再试，
+@@ -1401,6 +1848,27 @@ export class QqRuntime {
+       )
+       // 消息是这里唯一不可重建的东西，绝不能丢。
+       await this.#send(conversationId, `没能把消息交给会话，请重发一次。\n\n你的内容：\n${text}`)
++      return
++    }
++
++    /*
++     * 普通消息也要回一句「已发到」。
++     *
++     * ## 为什么普通消息需要它
++     *
++     * 用户的要求是"每次发消息都提示发到了哪个会话"，而普通消息恰恰是最容易
++     * **发错地方**的一条路径：`/switch` 之后绑定变了、或某个会话被归档后自动换绑，
++     * 用户下一句话就落进了另一条会话，而界面上看不出来。
++     * 一句「已发到「xxx」」是唯一能当场发现这件事的东西。
++     *
++     * ## 什么时候不说
++     *
++     * **新建会话时不说**：那一刻 `routed.decision.created` 为真，标题还是宿主刚取的、
++     * 常常就是这句话本身，回一句「已发到「这句话」」纯属噪音。
++     * 换绑时的 `notice` 已经把去向说清楚了，也不必重复。
++     */
++    if (routed.decision.created !== true && routed.decision.notice === undefined) {
++      await this.#confirmDelivered(conversationId, routed.decision.sessionId)
+     }
+   }
+ 
+@@ -1472,6 +1940,17 @@ export class QqRuntime {
+       peerId: parked.peerId,
+       text,
+       attachmentLines: lines,
++      /*
++       * ★ 这一批是**窗口到期自动投递**的，用户此刻并没有在说话。
++       *
++       * 所以目标会话正忙时**不要弹「这句话要怎么处理？」**——那个提示问的是
++       * "你说的这句话怎么办"，而此时压根没有"这句话"（只有一张图）。
++       * 用户看到提示会莫名其妙，而且 1/2/3/0 选完之后投递的仍是那张图，
++       * 与他以为自己在回答的东西对不上。
++       *
++       * 正确行为：直接排队，安静地把图交出去。
++       */
++      parkedAuto: true,
+     })
+   }
+ 
+@@ -1558,9 +2037,14 @@ export class QqRuntime {
+    * "经本频道创建的会话"里，其它会话一选就失败。
+    *
+    * @param sessionId - 目标会话。
++   * @param dirOverride - 可选：强制用这个目录作为 cwd（「快速对话」用）。
++   *   省略时按原有逻辑：会话存储里的 cwd，否则本频道工作目录。
+    */
+-  async #adoptSession(sessionId) {
+-    const stored = await storedSessionWorkspace(this.#home, sessionId)
++  async #adoptSession(sessionId, dirOverride) {
++    const stored =
++      typeof dirOverride === 'string' && dirOverride !== ''
++        ? dirOverride
++        : await storedSessionWorkspace(this.#home, sessionId)
+     const path = stored ?? this.#workspace
+     const own = isSameWorkspace(path, this.#workspace)
+     const workspaceId = await this.#workspaceIdFor(path, own ? WORKSPACE_TITLE : '')
+@@ -1708,6 +2192,7 @@ export class QqRuntime {
+           { content, requestId: `qq-${randomUUID()}`, sessionId, mode },
+           signal,
+         )
++        this.#noteSubmitted(sessionId, prompt, mode)
+         return true
+       } catch (error) {
+         // 带上会话 id：微信那批修复的第四条就是"提交失败没带会话 id"，
+@@ -1721,6 +2206,7 @@ export class QqRuntime {
+         { content, requestId: `qq-${randomUUID()}`, sessionId, mode: 'steer' },
+         signal,
+       )
++      this.#noteSubmitted(sessionId, prompt, 'steer')
+       return true
+     } catch (error) {
+       bootLog(`steer 被拒，退回 queue: ${describeError(error)}`)
+@@ -1730,6 +2216,7 @@ export class QqRuntime {
+         { content, requestId: `qq-${randomUUID()}`, sessionId, mode: 'queue' },
+         signal,
+       )
++      this.#noteSubmitted(sessionId, prompt, 'queue')
+       return true
+     } catch (error) {
+       this.#recordError(`排队提交也失败: session=${sessionId} ${describeError(error)}`)
+@@ -1737,6 +2224,34 @@ export class QqRuntime {
+     }
+   }
+ 
++  /**
++   * 记下"这个会话这一轮是什么时候开始的、问的是什么"，供 `/run` 展示。
++   *
++   * ## 只在**还没有记录**时写入
++   *
++   * 一个正在跑的回合里可能又被 steer 进来好几条消息。若每次都覆盖，
++   * 计时会不断被重置，`/run` 显示的就成了"最后一条消息等了多久"——
++   * 而用户问的是"这个任务跑了多久"。所以首次提交记时间，后续只更新提问内容。
++   *
++   * @param sessionId - 会话 id。
++   * @param prompt - 提交的文本（用于展示"在跑什么"）。
++   * @param mode - `'steer'` 或 `'queue'`。
++   */
++  #noteSubmitted(sessionId, prompt, mode) {
++    const existing = this.#runningSince.get(sessionId)
++    if (existing !== undefined) {
++      /*
++       * 已有记录：只更新提问内容。
++       *
++       * `queue` 意味着"等这一轮跑完再处理"，它**不是当前这一轮**的提问，
++       * 所以不该覆盖显示内容——覆盖了会让 `/run` 显示一个还没开始的问题。
++       */
++      if (mode !== 'queue') existing.prompt = prompt
++      return
++    }
++    this.#runningSince.set(sessionId, { startedAt: Date.now(), prompt })
++  }
++
+   // ---------------------------------------------------------------- 出站
+ 
+   /**
+@@ -1791,7 +2306,24 @@ export class QqRuntime {
+       recordOnce(this.#seen, `#frameShapes:${frameShape}`, `未知帧形态（宿主可能改了事件词汇）: ${frameShape}`)
+     }
+ 
+-    if ((text === undefined || text === '') && completed !== true) return
++    /*
++     * ★ 本地补丁：**工具调用帧必须放行**，这是旁白过滤能成立的前提。
++     *
++     * 原来这里是：
++     *
++     *     if ((text === undefined || text === '') && completed !== true) return
++     *
++     * 看起来无害——"没有正文、也不是结束帧，那就没事可做"。但 `block-start` 与
++     * `tool-call-delta` 恰好**两样都不是**：它们没有 `text`，也不是 `end`。
++     * 于是它们在到达下面的 `entry.sawTool = true` **之前**就被这一行挡掉了，
++     * `sawTool` 永远是 `false`，所有"这一轮用过工具"的判断全部空转——
++     * 表现就是过程旁白照旧一条条发到手机上。
++     *
++     * 现在多放行一种：**带 `toolCall` 的帧**。它不产生正文，只用来给这一轮做标记。
++     * 其余（纯 reasoning/usage/block-end 等）照旧提前返回，不进聚合路径。
++     */
++    const hasToolCall = toolCall !== undefined
++    if ((text === undefined || text === '') && completed !== true && !hasToolCall) return
+ 
+     this.#fire('回复聚合', async () => {
+       const state = await this.#store.read()
+@@ -1807,6 +2339,23 @@ export class QqRuntime {
+        * （`recordOnce`），既留下痕迹又不把日志刷爆。
+        */
+       if (conversationId === undefined) {
++        /*
++         * ★ 本地扩展：`notifyAllSessions` 打开时，未绑定会话的结果也送到 QQ。
++         *
++         * 判定顺序是有意的——**先判开关，再判旁白**：开关关着时完全走上游行为
++         * （记一行、丢弃），一个字节都不多发，免得"关了却还在推"。
++         *
++         * 打开后的取舍：
++         * - 只推**真正的收尾**（`completed` 且本轮没有工具调用），过程旁白一律不推。
++         *   这与绑定会话用的是同一条判据，避免"开了开关就被旁白刷屏"。
++         * - 用 `#boundConversation()` 解析目标：它已经处理了"多个绑定取最近使用"，
++         *   且在没有绑定时返回 undefined（那就没地方可推，只能记日志）。
++         * - 走 `#deliverOrQueue`：发不出去就排队，用户等的那条结果不该凭空消失。
++         */
++        if (this.#settings.notifyAllSessions === true) {
++          await this.#forwardUnbound(sessionId, { text, completed, toolCall })
++          return
++        }
+         recordOnce(
+           this.#seen,
+           `#unboundStreams:${sessionId}`,
+@@ -1818,14 +2367,61 @@ export class QqRuntime {
+ 
+       const existing = this.#replies.get(sessionId)
+       if (existing !== undefined) clearTimeout(existing.timer)
+-      const entry = existing ?? { text: '', conversationId, timer: undefined }
++      const entry = existing ?? { text: '', conversationId, timer: undefined, sawTool: false, narrationLen: 0 }
+       if (text !== undefined) entry.text += text
+ 
++      /*
++       * ★ 本地补丁（上游 1.0.3 没有这一条）。
++       *
++       * ## 问题
++       *
++       * DSH 的 `AssistantStreamAttempt` 是**按每个 model attempt** 创建的
++       * （`dsh-agent-loop` 里 `++this.assistantAttemptCounter`），每个 attempt 结束都发一个
++       * `frame.type === 'end'`。所以一个「拆成 7 次提交」的任务 = 7 个 attempt = 7 个 end 帧，
++       * 而原本"见到 end 就立刻发"的逻辑会把它切成 7 条 QQ 消息，
++       * 内容正是模型在工具调用之间的旁白（"第 1 次提交完成，继续第 2 次…"）。
++       *
++       * `settleMs` 对这条路径**无效**——它只管非 end 帧，end 帧是立即发送的。
++       *
++       * ## 判据
++       *
++       * **一个 attempt 里出现过工具调用 = 模型还在干活，不是任务完成。**
++       * 那种 attempt 的正文是过程旁白，压住不发，并把它记为"旁白区"
++       * （`narrationLen` 记住当前正文里属于旁白的长度）。
++       * 直到出现一个**没有工具调用**的 attempt——那才是真正的收尾，
++       * 此时只发这个收尾 attempt 自己的正文，旁白区整段丢弃。
++       *
++       * `sawTool` 必须在每个 end 帧后复位，否则第一个工具调用就会让它永久为 true。
++       */
++      if (toolCall !== undefined) entry.sawTool = true
++
+       if (completed === true) {
+-        // 回合结束：立刻发，不要压在静默窗口后面。
++        if (entry.sawTool === true) {
++          // 这一轮用过工具：仍在干活。把已累积的正文标记为旁白，等真正的收尾。
++          entry.narrationLen = entry.text.length
++          entry.sawTool = false
++          this.#replies.set(sessionId, entry)
++          return
++        }
++        /*
++         * 真正的收尾（这一轮没有工具调用）。
++         *
++         * 只发收尾 attempt 自己的正文（跳过旁白区）。若它一个字都没有
++         * （模型直接以工具调用收尾的极端情况），退回发全部正文——
++         * 宁可带上旁白，也不能让回答凭空消失。
++         */
++        const finalText = entry.text.slice(entry.narrationLen)
+         this.#replies.set(sessionId, entry)
+         this.#stopTyping(conversationId)
+-        await this.#flushReply(sessionId)
++        await this.#flushReply(sessionId, finalText.trim() === '' ? undefined : finalText)
++        /*
++         * 绑定会话收尾时也记一笔。
++         *
++         * 不记的话会出现一种别扭的落差：用户在桌面端让一个会话跑完（收到了推送），
++         * 然后又回到 QQ 绑定的这个会话问了一句，此时 `rrr` 指的还是上一个未绑定的会话——
++         * 而用户心里"刚跑完的那个"已经换人了。
++         */
++        await this.#rememberFinished(sessionId)
+         return
+       }
+       entry.timer = setTimeout(() => {
+@@ -1836,54 +2432,1382 @@ export class QqRuntime {
+     })
+   }
+ 
+-  /** 发出并清空某会话缓冲的回复。 */
+-  async #flushReply(sessionId) {
+-    const entry = this.#replies.get(sessionId)
+-    // 没有缓冲（别处已经发过 / 定时器与回合结束撞在一起）**不是丢东西**：
+-    // 下面那个 `text === ''` 同理——两处都无事可做，所以刻意不记日志。
+-    if (entry === undefined) return
+-    this.#replies.delete(sessionId)
+-    const text = entry.text.trim()
+-    if (text === '') return
+-    await this.#sendReply(entry.conversationId, text)
++  /**
++   * `/111 x` → 字面 `111 x`（用户定义的转义写法）。
++   *
++   * ## 规则
++   *
++   * | 输入 | 结果 |
++   * |---|---|
++   * | `/111 你好` | `111 你好` 发给**当前绑定**会话 |
++   * | `/111` | `111` |
++   * | `/1111` | `undefined`（不是本函数的事） |
++   * | `//111 你好` | `undefined`（`//` 已被 `#unescapeSlashCommand` 先吃掉） |
++   *
++   * ## 与 `111` 的关系
++   *
++   * `111 你好` = 发到**快速对话目录**的最新会话（不切绑定）；
++   * `/111 你好` = 把字面量「111 你好」发给**当前**会话。
++   * 两者互不干扰，`/111` 是"我要打这三个数字本身"的写法。
++   *
++   * @param text - 用户原文。
++   * @returns 去掉前导斜杠的文本，或 `undefined`。
++   */
++  #unescapeLiteral111(text) {
++    if (typeof text !== 'string') return undefined
++    /*
++     * 只要求"以 `/111` 开头"，**不再要求后面跟空格**：
++     * 用户既然已经打了斜杠，意图就是"我要发字面的 111"，紧贴内容同样成立
++     * （`/111190.254…` 与 `/111 190.254…` 等价）。
++     */
++    if (!/^\/111/.test(text)) return undefined
++    const literal = text.slice(1)
++    bootLog(`字面 111：${text.slice(0, 24)} -> ${literal.slice(0, 24)}`)
++    return literal
+   }
+ 
+   /**
+-   * 发送一条**回复**，超长时降级为文件。
++   * 某个会话**此刻是否正在跑任务**。
+    *
+-   * 移植自微信的 `maxReplyChars`。不降级的话，一条上万字的回复会被
+-   * `TEXT_CHUNK_LIMIT` 切成好几条消息刷屏——手机上要连划好几屏，
+-   * 而且中间那几条读起来是断的。
++   * ## 依据
+    *
+-   * 微信的原话同样适用：先给一句 caption，**免得文件变成一个没有说明的附件**。
+-   * 文件写进媒体目录，所以用户在电脑上也能找到它。
++   * `sessionController.list()` 的每一项带 `running` 字段
++   * （`dsh-api-session-controller` 的 `summaryFor`：`agents.get(id)?.status === 'running'`）。
++   * 那是宿主自己维护的实时状态，比自己记账可靠。
+    *
+-   * @param conversationId - 对话键。
+-   * @param text - 已 trim 的回复正文。
++   * ## 拿不到时怎么办
++   *
++   * 服务不存在、或这条会话不在清单里（还没被创建过），一律当**不忙**。
++   * 这个方向是有意的：误判"忙"会让每条消息都弹一次选择，把正常对话拖成审问；
++   * 而误判"不忙"最多是退回原来的行为（steer 被拒后自动排队），没有损失。
++   *
++   * @param sessionId - 目标会话。
++   * @returns 是否正在运行。
+    */
+-  async #sendReply(conversationId, text) {
+-    const plan = planReply(text, this.#settings.maxReplyChars)
+-    if (plan.kind === 'send') {
+-      await this.#send(conversationId, plan.text)
+-      return
++  async #isSessionRunning(sessionId) {
++    const controller = this.#ctx.sessionController
++    if (typeof controller?.list !== 'function') return false
++    const rows = await this.#listSessionsSafe(controller)
++    if (rows === undefined) return false
++    const row = rows.find((item) => item?.sessionId === sessionId)
++    return row?.running === true
++  }
++
++  /**
++   * 调用宿主的 `sessionController.list()`，把**返回值形状**统一成一个数组。
++   *
++   * ## 为什么需要包一层
++   *
++   * 真实故障：`list` 的签名是 `list(_request, signal)`，**先要一个请求对象**，
++   * 而原来只传了 signal，于是请求对象成了 signal、signal 成了 `undefined`。
++   * 宿主没抛错，只是返回了**别的形状**——`/run` 于是回了一句
++   * 「拿到的会话状态格式不对」，用户看到的就是一个不能用的功能。
++   *
++   * 除了参数顺序，返回形状也不止一种（`SessionListValue` 可能是数组，
++   * 也可能是个带 `sessions` / `items` 的包装）。这里把三种常见形状都认下来，
++   * 而不是赌其中一种。
++   *
++   * @param controller - 会话控制器。
++   * @returns 会话行数组；调用失败或形状不认识时 `undefined`。
++   */
++  async #listSessionsSafe(controller) {
++    let result
++    try {
++      // 先按宿主签名传请求对象；老组合（只要 signal）再试一次。
++      result = await controller.list({}, new AbortController().signal)
++    } catch (first) {
++      try {
++        result = await controller.list(new AbortController().signal)
++      } catch (second) {
++        bootLog(`查询会话清单失败: ${describeError(second)}`)
++        return undefined
++      }
+     }
+-    await this.#send(conversationId, plan.caption)
++    if (Array.isArray(result)) return result
++    if (Array.isArray(result?.sessions)) return result.sessions
++    if (Array.isArray(result?.items)) return result.items
++    bootLog(
++      `会话清单形状不认识（可能宿主改了返回类型）: ${Object.keys(result ?? {}).join(',') || String(result)}`,
++    )
++    return undefined
++  }
++
++  /**
++   * 从宿主的清单行里读出"这一轮提问"的时间戳，作为**开始时间**。
++   *
++   * ## 为什么需要它
++   *
++   * `#runningSince` 只记本插件自己提交的那些。桌面端直接开的会话没有记录，
++   * `/run` 于是显示「开始时间未知」——而它明明在跑，只是"[我们不知道什么时候开始的]"。
++   *
++   * ## 取哪个字段
++   *
++   * 宿主每行带 `projections.values.sessionListMetadata.lastPromptAt`
++   * （`SessionListMetadata.lastPromptAt`：折叠前缀里**最近一次人类提问的时间**）。
++   * 那是这一轮的起点，正是"跑了多久"该从哪儿算。
++   *
++   * 取不到就 `undefined`，调用方按"未知"显示——**不拿 `updatedAt` 冒充开始时间**：
++   * 后者是会话最后一次写入（工具调用也在写），会高估本轮的运行时长。
++   *
++   * @param row - `list()` 返回的一行（`SessionSummary`）。
++   * @returns 时间戳（毫秒），或 `undefined`。
++   */
++  #promptAtFromRow(row) {
++    const values = row?.projections?.values
++    if (values === undefined || values === null) return undefined
++    const at = values.sessionListMetadata?.lastPromptAt
++    return typeof at === 'number' && Number.isFinite(at) && at > 0 ? at : undefined
++  }
++
++  /**
++   * 目标会话正忙时，**不直接投递**，而是问用户怎么办。
++   *
++   * ## 四个选项
++   *
++   * | 回复 | 行为 |
++   * |---|---|
++   * | `1` | 插入（steer）：打断当前回合，agent 立刻看到这句话 |
++   * | `2` | 排队（queue）：等这一轮跑完再处理 |
++   * | `3` | 分叉（fork）：在同工作区复制一个会话，消息发到那里，**并把 QQ 绑定切过去** |
++   * | `0` | 撤回：这条消息不发了 |
++   *
++   * ## 为什么要问
++   *
++   * 原来的实现是"先 steer、被拒再 queue"——它默认用户想插话。
++   * 但在手机上补一句话，用户常常只是想**排队**；而 steer 会打断正在跑的多步任务，
++   * 让它偏离原计划。这个代价不可逆，所以交给用户当场决定。
++   *
++   * @param conversationId - 提问的对话。
++   * @param sessionId - 目标会话。
++   * @param text - 用户原话（存起来等回答）。
++   * @param mode - 来源：`'bound'` / `'quick'` / `'rrr'`（决定 `3` 之后怎么切）。
++   * @returns 永远 `true`（已处理，调用方不该继续投递）。
++   */
++  async #askBusyChoice(conversationId, sessionId, text, mode) {
++    await this.#store.update((next) => {
++      next.pendingBusy[conversationId] = { sessionId, text, mode, at: Date.now() }
++    })
++    await this.#send(
++      conversationId,
++      [
++        '那个会话正在跑任务，这句话要怎么处理？',
++        '',
++        '1  插入：打断当前任务，立刻让它看到这句话',
++        '2  排队：等这一轮跑完再处理',
++        '3  分叉：在同工作区复制一个会话处理这句话，并把 QQ 切到新会话',
++        '0  撤回：这条不发了',
++        '',
++        '直接回数字即可。',
++      ].join('\n'),
++    )
++    bootLog(`忙时抉择：conversation=${conversationId} session=${sessionId} mode=${mode}`)
++    return true
++  }
++
++  /**
++   * 处理用户对"正忙"提示的回答。
++   *
++   * @param conversationId - 提问的对话。
++   * @param peerId - 对端 id（typing 用）。
++   * @param text - 用户原文。
++   * @returns `true` 表示已处理（吞掉这条消息）。
++   */
++  async #handleBusyChoice(conversationId, peerId, text) {
++    const state = await this.#store.read()
++    const pending = state.pendingBusy[conversationId]
++    if (pending === undefined) return false
++
++    const raw = typeof text === 'string' ? text.trim() : ''
++    // 只认单个数字。其它内容说明用户改主意了、想说别的——
++    // 那就把提示作废，让这条消息走正常路径（不把他困在一个答不了的提示里）。
++    if (!/^[0123]$/.test(raw)) {
++      await this.#store.update((next) => {
++        delete next.pendingBusy[conversationId]
++      })
++      return false
++    }
++
++    await this.#store.update((next) => {
++      delete next.pendingBusy[conversationId]
++    })
++
++    const { sessionId, text: original, mode } = pending
++
++    if (raw === '0') {
++      await this.#send(conversationId, '已撤回，这条没有发出去。')
++      bootLog(`忙时抉择：撤回 conversation=${conversationId}`)
++      return true
++    }
++
++    if (raw === '2') {
++      const ok = await this.#submit(sessionId, original, 'queue')
++      if (ok) {
++        await this.#send(conversationId, `已排队，等这一轮跑完就处理。\n${await this.#deliveredLine(sessionId)}`)
++      } else {
++        await this.#send(conversationId, '排队失败，请重发一次。')
++      }
++      bootLog(`忙时抉择：排队 conversation=${conversationId} ok=${String(ok)}`)
++      return true
++    }
++
++    if (raw === '1') {
++      const ok = await this.#submit(sessionId, original, 'steer')
++      if (ok) {
++        await this.#send(conversationId, `已插入，它会立刻看到这句话。\n${await this.#deliveredLine(sessionId)}`)
++      } else {
++        // steer 被拒（回合刚好结束）时退回排队——这是最接近用户意图的降级。
++        const queued = await this.#submit(sessionId, original, 'queue')
++        await this.#send(
++          conversationId,
++          queued
++            ? `插入没成功（那一轮可能刚好结束），已改为排队。\n${await this.#deliveredLine(sessionId)}`
++            : '插入和排队都失败了，请重发一次。',
++        )
++      }
++      bootLog(`忙时抉择：插入 conversation=${conversationId} ok=${String(ok)}`)
++      return true
++    }
++
++    // raw === '3'：分叉
++    return await this.#forkAndSwitch(conversationId, peerId, sessionId, original, mode)
++  }
++
++  /**
++   * 分叉一个会话，把这条消息发到新会话，并把 QQ 绑定切过去。
++   *
++   * ## 为什么用宿主的 `fork`
++   *
++   * `sessionController.fork` 会复制到**最近的已完成回合边界**，子会话继承源会话的
++   * `cwd` 并挂到同一个工作区（`forkWorkspace(source.header)`）。这正是用户说的
++   * "在同工作区通过这个会话分支出一个会话"——插件不该自己拼一份历史。
++   *
++   * ## 边界可能不存在
++   *
++   * 源会话如果**一个回合都没跑完过**，`fork` 会抛 `session/fork-unavailable`。
++   * 那种情况下分叉没有意义（没有可继承的上下文），所以直接退回排队并说明。
++   *
++   * @param conversationId - 提问的对话。
++   * @param peerId - 对端 id。
++   * @param sessionId - 源会话。
++   * @param text - 要发送的话。
++   * @param mode - 来源。
++   * @returns `true`（已处理）。
++   */
++  async #forkAndSwitch(conversationId, peerId, sessionId, text, mode) {
++    const controller = this.#ctx.sessionController
++    if (typeof controller?.fork !== 'function') {
++      const queued = await this.#submit(sessionId, text, 'queue')
++      await this.#send(
++        conversationId,
++        queued
++          ? '这个版本没有分叉功能，已改为排队。'
++          : '没有分叉功能，排队也失败了，请重发一次。',
++      )
++      return true
++    }
++
++    let childId
++    try {
++      const result = await controller.fork({ sessionId })
++      childId = typeof result?.sessionId === 'string' ? result.sessionId : undefined
++      if (childId === undefined) throw new Error('fork 没有返回 sessionId')
++    } catch (error) {
++      /*
++       * 分叉失败时**不丢消息**：退回排队。
++       *
++       * 最常见的原因是源会话没有已完成的回合（`session/fork-unavailable`），
++       * 那时没有可继承的上下文，分叉本来也没有意义。
++       */
++      this.#recordError(`分叉失败，改为排队: ${describeError(error)}`)
++      const queued = await this.#submit(sessionId, text, 'queue')
++      await this.#send(
++        conversationId,
++        queued
++          ? `分叉失败（${describeError(error)}），已改为排队。`
++          : '分叉和排队都失败了，请重发一次。',
++      )
++      return true
++    }
++
++    /*
++     * 采纳子会话——否则宿主不认识它、prompt 会被拒（与快速对话同一条理由）。
++     * 然后提交那句话。
++     */
++    try {
++      await this.#adoptSession(childId)
++    } catch (error) {
++      this.#recordError(`分叉出的会话采纳失败: ${describeError(error)}`)
++    }
++    const sent = await this.#submit(childId, text, 'queue')
++
++    /*
++     * 把 QQ 绑定切到新会话。
++     *
++     * 用户明确要求"qq 的当前会话也一起切过去"——分叉出来的会话就是为了接着聊，
++     * 不切的话用户下一条消息还回到原来那个正在跑的会话，等于白分。
++     */
++    try {
++      await this.#store.update((next) => {
++        const existing = next.bindings[conversationId]
++        next.bindings[conversationId] = {
++          ...(existing ?? {}),
++          conversationId,
++          accountId: existing?.accountId ?? this.#appId,
++          peerId: existing?.peerId ?? '',
++          sessionId: childId,
++          title: existing?.title ?? 'QQ',
++          createdAt: existing?.createdAt ?? Date.now(),
++          lastUsedAt: Date.now(),
++        }
++      })
++    } catch (error) {
++      this.#recordError(`切换绑定到分叉会话失败: ${describeError(error)}`)
++    }
++    // 与 `/run` 同一条：直接写盘后要让路由重新读，否则 `/list` 仍报旧会话。
++    this.#router?.invalidateBindings()
++
++    await this.#send(
++      conversationId,
++      sent
++        ? `已分叉出新会话并切过去。\n${await this.#deliveredLine(childId)}`
++        : `已分叉出新会话并切过去，但这句话没发出去，请重发一次。\n${shortId(childId)}`,
++    )
++    bootLog(`忙时抉择：分叉 conversation=${conversationId} 源=${sessionId} 新=${childId} mode=${mode}`)
++    return true
++  }
++
++  /**
++   * `/rrr x` → 字面 `rrr x`（与 `/111` 同一种转义）。
++   *
++   * @param text - 用户原文。
++   * @returns 去掉前导斜杠的文本，或 `undefined`。
++   */
++  #unescapeLiteralRrr(text) {
++    if (typeof text !== 'string') return undefined
++    // 与 `/111` 同一条：只要以 `/rrr` 开头就认，不要求后面跟空格。
++    if (!/^\/rrr/.test(text)) return undefined
++    const literal = text.slice(1)
++    bootLog(`字面 rrr：${text.slice(0, 24)} -> ${literal.slice(0, 24)}`)
++    return literal
++  }
++
++  /**
++   * `rrr <内容>`：回话给**最近跑完任务**的那个会话。
++   *
++   * ## 为什么需要
++   *
++   * `notifyAllSessions` 打开后，任何会话跑完都会推一条结果到 QQ。
++   * 用户看到那条推送，常常想**接着说一句**——「你真厉害」「再改一下这里」。
++   * 但那条推送来自一个**没绑定**的会话，普通消息只会落到当前绑定的会话上。
++   * `rrr` 就是那个"接着说"的入口。
++   *
++   * ## 目标从哪来
++   *
++   * `state.lastFinished`（见 `#rememberFinished`）。它持久化，所以中间重启过也还认得。
++   * 目标**不切换绑定**——回完这一句，用户继续说话照旧回到原来的会话。
++   *
++   * ## 没有任何已完成会话时
++   *
++   * 回一句说明并**吞掉**这条消息（返回 `true`）。不降级成普通文本：
++   * 用户明确打了 `rrr`，静默改成别的意思比报错更糟。
++   *
++   * @param conversationId - 提问的对话（回复发这里）。
++   * @param peerId - 对端 id（typing 指示用）。
++   * @param text - 用户原文。
++   * @returns `true` 表示已处理。
++   */
++  async #handleFinishedReply(conversationId, peerId, text) {
++    /*
++     * 与 `111` 用同一套识别规则，但**额外允许句中独立成词**。
++     *
++     * 真实故障：用户发「//i rrr 要等添加过滤条件…」，想同时开 ADHD 模式并把要求
++     * 转给上一个跑完的会话。`//` 转义先命中，整条被原样交给当前会话，
++     * `rrr` 一次都没被检查——用户看到的是"没能识别三个 r"。
++     *
++     * `rrr` 是字母词，出现在句中（`/i rrr 要做什么`）几乎没有歧义；
++     * 而 `111` 留在句中常常是内容本身（「第 111 行」），所以只有它不开这一条。
++     */
++    const body = extractTriggerWord(text, 'rrr', { allowMiddle: true })
++    if (body === undefined) return false
++
++    if (body === '') {
++      await this.#send(conversationId, 'rrr 后面没写内容。用法：rrr 你的话')
++      return true
++    }
++
++    const state = await this.#store.read()
++    const target = state.lastFinished
++    if (target === null || typeof target.sessionId !== 'string') {
++      await this.#send(
++        conversationId,
++        '还没有任何会话跑完过任务，rrr 不知道该发给谁。\n' +
++          '（这个功能需要先开启「任何会话结束都推送结果」，并等某个会话真的完成一次。）',
++      )
++      return true
++    }
++
++    /*
++     * 会话可能已经被删掉或归档。先确认它还在宿主的清单里——
++     * 直接 prompt 一条不存在的会话会抛，而用户看到的会是一句莫名其妙的错误。
++     */
++    let alive = true
++    try {
++      const all = await this.#gateway().listSessions()
++      alive = all.some((row) => row.sessionId === target.sessionId)
++    } catch {
++      // 查不到就当它还活着：让下面那次提交给出真实答案，而不是这里猜。
++      alive = true
++    }
++    if (!alive) {
++      await this.#send(
++        conversationId,
++        `那个会话（${target.title === '' ? target.sessionId : target.title}）已经不在了，rrr 发不出去。`,
++      )
++      return true
++    }
++
++    /*
++     * 那个会话正在跑任务时，先问用户怎么办。
++     *
++     * `rrr` 的典型场景恰恰是"它刚跑完、我想接着说"，所以不忙是常态；
++     * 但用户也可能在它跑着的时候就想插一句——那时同样该由他决定是插入还是排队。
++     */
++    if (await this.#isSessionRunning(target.sessionId)) {
++      await this.#askBusyChoice(conversationId, target.sessionId, body, 'rrr')
++      return true
++    }
++
++    this.#startTyping(conversationId, peerId)
++    try {
++      // 采纳它，否则宿主不认识这条会话、prompt 会被拒（与快速对话同一条理由）。
++      await this.#adoptSession(target.sessionId)
++      const note = this.#settings.presenceNote.trim()
++      const content = note === '' ? body : `${body}\n\n${note}`
++      await this.#ctx.sessionController.prompt(
++        {
++          requestId: `qq-rrr-${randomUUID()}`,
++          sessionId: target.sessionId,
++          mode: 'queue',
++          content: [{ type: 'text', text: content }],
++        },
++        new AbortController().signal,
++      )
++      bootLog(`rrr：回话给 ${target.sessionId}（${String(body.length)} 字，绑定未变）`)
++      await this.#confirmDelivered(conversationId, target.sessionId)
++    } catch (error) {
++      this.#recordError(`rrr 提交失败: ${describeError(error)}`)
++      await this.#send(conversationId, `rrr 发送失败：${describeError(error)}`)
++    }
++    return true
++  }
++
++  /**
++   * 把一段文本直接交给**当前绑定的**会话，不经过路由。
++   *
++   * `//x` 转义专用：剥掉一层斜杠后的 `/i` 要原样送到 agent，
++   * 而路由见到 `/` 就会走 `#command` 并把它当未知指令吞掉。
++   *
++   * 除了跳过路由，其余与普通消息完全一致：同样的 `presenceNote`、
++   * 同样的 steer→queue 退让、同样的失败留痕与回吐。
++   *
++   * @param conversationId - 对话键（失败时回吐用）。
++   * @param accountId - 账号 id（未使用，保留签名一致性）。
++   * @param peerId - 对端 id（typing 指示用）。
++   * @param text - 已剥掉转义斜杠的文本。
++   * @param attachmentLines - 附件描述行。
++   */
++  async #deliverToBound(conversationId, accountId, peerId, text, attachmentLines) {
++    const state = await this.#store.read()
++    const binding = state.bindings[conversationId]
++    if (binding === undefined) {
++      await this.#send(
++        conversationId,
++        `这条对话还没有绑定会话，无法转发 ${text}。先随便说句话建一条，或发 /new。`,
++      )
++      return
++    }
++
++    /*
++     * 目标会话正在跑任务时，先问用户怎么办（插入/排队/分叉/撤回）。
++     *
++     * 这里与普通消息共用同一套抉择：`//i` 这类命令插进一个正在跑的回合，
++     * 效果同样是"打断它"，所以不该因为它是个命令就绕过这个问题。
++     */
++    if (await this.#isSessionRunning(binding.sessionId)) {
++      await this.#askBusyChoice(conversationId, binding.sessionId, text, 'bound')
++      return
++    }
++
++    await this.#adoptSession(binding.sessionId)
++    this.#startTyping(conversationId, peerId)
++
++    const note = this.#settings.presenceNote.trim()
++    const outbound = composeDelivery({ promptText: text, attachmentLines, note })
++
++    let accepted = false
++    for (const part of outbound) {
++      if (await this.#submit(binding.sessionId, part, 'steer')) accepted = true
++      else if (await this.#submit(binding.sessionId, part, 'queue')) accepted = true
++    }
++
++    if (!accepted) {
++      this.#stopTyping(conversationId)
++      this.#recordError(
++        `转义命令提交失败：插话与排队都未成功（conversation=${conversationId} session=${binding.sessionId}）`,
++      )
++      await this.#send(conversationId, `没能把 ${text} 交给会话，请重发一次。`)
++      return
++    }
++    bootLog(`转义命令已交付：${text.slice(0, 40)} -> session=${binding.sessionId}`)
++    await this.#confirmDelivered(conversationId, binding.sessionId)
++  }
++
++  /**
++   * `//x` → `/x`：把 DSH 自己的斜杠命令送过插件的指令层。
++   *
++   * ## 为什么需要
++   *
++   * 路由是 `if (text.startsWith('/')) return await this.#command(...)`，
++   * 而 `#command` 的 `default` 分支会**回一句「未知指令」并吞掉消息**。
++   * 于是 `/i`（一个 DSH skill 手势）在 QQ 里永远到不了 agent——
++   * 用户看到的是一张帮助清单，而不是 ADHD 模式开启。
++   *
++   * ## 规则
++   *
++   * | 输入 | 结果 |
++   * |---|---|
++   * | `//i` | `/i` 交给 agent |
++   * | `//i-have-adhd` | `/i-have-adhd` |
++   * | `///i` | `//i`（只剥一层，于是要发字面的 `//i` 仍有办法） |
++   * | `/i` | `undefined`（不归本函数管，交给路由回「未知指令」） |
++   *
++   * @param text - 用户原文（已 trim）。
++   * @returns 剥掉一层斜杠后的文本，或 `undefined` 表示"不归我管"。
++   */
++  #unescapeSlashCommand(text) {
++    if (typeof text !== 'string' || !text.startsWith('//')) return undefined
++    const stripped = text.slice(1)
++    bootLog(`转义斜杠：${text.slice(0, 24)} -> ${stripped.slice(0, 24)}`)
++    return stripped
++  }
++
++  /**
++   * `111 <内容>`：把内容发到「快速对话」目录的最新会话，**不动当前绑定**。
++   *
++   * ## 为什么是"另发一条"而不是"切过去"
++   *
++   * 用户明确要求：`111` 只是**顺手问一句**，问完继续原来的对话。
++   * 所以这里既不写 `bindings`，也不碰 `#lastInbound`——当前绑定的会话
++   * 在用户下一条普通消息时照旧收到消息。
++   *
++   * ## 关闭与降级
++   *
++   * `quickWorkspacePath` 为空 = 不启用，返回 `false` 让调用方当普通文本处理
++   * （用户明确要求："没设置就直接理解成 111"）。
++   *
++   * @param conversationId - 提问的对话（回复发这里）。
++   * @param peerId - 对端 id（typing 指示用）。
++   * @param text - 用户原文。
++   * @returns `true` 表示已处理，`false` 表示"不归我管"。
++   */
++  async #handleQuickChannel(conversationId, peerId, text) {
++    /*
++     * 触发词的识别交给 `extractTriggerWord`：它同时认"开头紧贴"「111190.254…」、
++     * "独立成词"「111 你好」与"结尾"「你好 111」，并挡掉纯数字（`1111`）。
++     * 旧实现只认 `/^111(?:\s|$)/`，于是没空格的写法整条失效——用户实测报的那个问题。
++     */
++    const body = extractTriggerWord(text, '111')
++    if (body === undefined) return false
++
++    const candidate =
++      typeof this.#settings.quickWorkspacePath === 'string'
++        ? this.#settings.quickWorkspacePath.trim()
++        : ''
++    if (candidate === '') {
++      // 未启用：原样当普通文本（用户要求）。记一行，免得"为什么 111 没反应"无处可查。
++      recordOnce(
++        this.#seen,
++        '#quickDisabled',
++        '收到 111 前缀，但「快速对话目录」未设置，已按普通文本处理',
++      )
++      return false
++    }
++
++    const resolved = resolveWorkspaceDir(this.#home, candidate)
++    if (resolved.fellBack) {
++      await this.#send(
++        conversationId,
++        `「快速对话目录」不可用，111 已按普通文本处理。\n原因：${String(resolved.reason ?? '未知')}`,
++      )
++      return false
++    }
++
++    if (body === '') {
++      await this.#send(conversationId, '111 后面没写内容。用法：111 你的问题')
++      return true
++    }
++
++    let sessionId
++    try {
++      sessionId = await this.#quickSession(resolved.path)
++    } catch (error) {
++      this.#recordError(`快速对话会话准备失败: ${describeError(error)}`)
++      await this.#send(conversationId, `快速对话失败：${describeError(error)}`)
++      return true
++    }
++
++    /*
++     * 快速对话那个会话正在跑任务时，先问用户怎么办。
++     *
++     * 与其它入口共用同一套抉择：快速对话常被用来"顺手问一句"，
++     * 而那个会话可能正在跑上一个问题——插进去会打断它。
++     */
++    if (await this.#isSessionRunning(sessionId)) {
++      await this.#askBusyChoice(conversationId, sessionId, body, 'quick')
++      return true
++    }
++
++    this.#startTyping(conversationId, peerId)
++    try {
++      const note = this.#settings.presenceNote
++      const content = note === '' ? body : `${body}\n\n${note}`
++      await this.#ctx.sessionController.prompt(
++        {
++          requestId: `qq-quick-${randomUUID()}`,
++          sessionId,
++          mode: 'queue',
++          content: [{ type: 'text', text: content }],
++        },
++        new AbortController().signal,
++      )
++      bootLog(`快速对话：111 -> session=${sessionId}（${String(body.length)} 字，绑定未变）`)
++      /*
++       * 回一句「已发到」。
++       *
++       * 用户要求所有投递路径都给同样的确认（`rrr` 早就有了）。
++       * 理由是一致的：`111` 发去的是**另一个**会话，而手机上看到的只有这条确认——
++       * 没有它，用户无法分辨"发出去了"与"掉进了当前对话"。
++       */
++      await this.#confirmDelivered(conversationId, sessionId)
++    } catch (error) {
++      this.#recordError(`快速对话提交失败: ${describeError(error)}`)
++      await this.#send(conversationId, `快速对话提交失败：${describeError(error)}`)
++    }
++    return true
++  }
++
++  /**
++   * 回一句「已发到「会话名」。」——所有投递路径共用的确认。
++   *
++   * ## 为什么统一到一个方法
++   *
++   * 这个确认语的措辞被四个地方用到（`rrr`、`111`、`//x` 转义、普通消息），
++   * 各写一份必然会漂移：一处叫「已发到」、一处叫「已发送」，用户读到的是不一致的系统。
++   * 而且会话名的取法（标题 → 短 id）也要一致，否则同一条会话在两个入口下叫两个名字。
++   *
++   * ## 失败不吵
++   *
++   * 确认只是"顺带说一句"，发不出去不该盖掉真正的结果。
++   * 但也不能静默——记一行，免得"为什么这次没有确认"无从查起。
++   *
++   * @param conversationId - QQ 对话。
++   * @param sessionId - 消息实际投递到的会话。
++   */
++  async #confirmDelivered(conversationId, sessionId) {
++    try {
++      await this.#send(conversationId, await this.#deliveredLine(sessionId))
++    } catch (error) {
++      bootLog(`投递确认发送失败（不影响消息本身）: ${describeError(error)}`)
++    }
++  }
++
++  /**
++   * 「已发到「会话名」。」这一句本身。
++   *
++   * 拆出来是因为有些地方要把它**拼在别的回复后面**（忙时抉择的插入/排队确认），
++   * 而那些地方不能为此多发一条消息——手机上两条紧挨着的气泡读起来像两次操作。
++   *
++   * @param sessionId - 消息实际投递到的会话。
++   * @returns 一行确认语。
++   */
++  async #deliveredLine(sessionId) {
++    return `已发到「${await this.#sessionLabel(sessionId)}」。`
++  }
++
++  /**
++   * 取一条会话给人看的名字：标题优先，没有就用短 id。
++   *
++   * @param sessionId - 会话 id。
++   * @returns 名字（不会是空串）。
++   */
++  async #sessionLabel(sessionId) {
++    try {
++      const all = await this.#gateway().listSessions()
++      const row = all.find((item) => item.sessionId === sessionId)
++      const title = typeof row?.title === 'string' ? row.title.trim() : ''
++      if (title !== '') return title
++    } catch {
++      // 取不到标题不算错误：短 id 仍然能定位。
++    }
++    return shortId(sessionId)
++  }
++
++  /**
++   * 取得「快速对话」目录下**最近使用**的会话；没有就建一条。
++   *
++   * 复用宿主的会话清单而不是自己记账：插件重启后仍然接得上同一条会话，
++   * 而"最近使用"由宿主的排序决定，不需要插件再维护一份 lastUsedAt。
++   *
++   * @param dir - 快速对话目录（绝对路径，已确保存在）。
++   * @returns 会话 id。
++   */
++  async #quickSession(dir) {
++    const all = await this.#gateway().listSessions()
++    const same = all.filter((row) => {
++      const cwd = typeof row.cwd === 'string' ? row.cwd : ''
++      return cwd !== '' && isSameWorkspace(cwd, dir)
++    })
++
++    if (same.length > 0) {
++      // 宿主已按最近活动排序（与 `/list` 同一份清单），取第一条即可。
++      const picked = same[0]
++      await this.#adoptSession(picked.sessionId, dir)
++      return picked.sessionId
++    }
++
++    const sessionId = mintSessionId()
++    // 先采纳（把 cwd/工作区钉好），再给标题——与 `#bind` 同一条顺序。
++    await this.#adoptSession(sessionId, dir)
++    await this.#nameSession(sessionId, 'QQ 快速对话')
++    bootLog(`快速对话：在 ${dir} 下新建会话 ${sessionId}`)
++    return sessionId
++  }
++
++  /**
++   * 如果刚才那条回复是"已切换"或"已新建"，把会话的最后一次提问补发一条。
++   *
++   * ## 为什么需要
++   *
++   * 切过去之后，用户在手机上看到的是一片空白（历史在电脑上）。他不知道这个会话
++   * 在干什么、刚问过什么，于是第一条消息往往要花在"这是哪个"上。
++   * 把最后一次提问贴出来，等于给这条对话一个可见的开头。
++   *
++   * ## 提问从哪来（三级读取）
++   *
++   * 1. 本插件自己记的（`#runningSince` 里的 `prompt`）——最准，是用户的原话；
++   * 2. 磁盘索引的 `turnOutline.turns.at(-1).prompt`（通过 `readStoredSessionDetails`）——
++   *    桌面端开的、之前运行完的会话，从这里能拿到真实提问；
++   * 3. 全新会话（`/new` 或从无提问记录）——明确说明「（新会话，暂无提问）」。
++   *
++   * @param conversationId - QQ 对话。
++   * @param replyText - 刚发出去的那条回复。
++   */
++  async #sendLastPromptIfSwitched(conversationId, replyText) {
++    if (typeof replyText !== 'string') return
++    if (!/^(已切换到|已新建对话)/.test(replyText)) return
++
++    const state = await this.#store.read()
++    const binding = state.bindings[conversationId]
++    if (binding === undefined) return
++
++    const sessionId = binding.sessionId
++    let prompt = ''
++    let timeStr = ''
++
++    // 1. 如果正在由本插件实时追踪运行
++    const tracked = this.#runningSince.get(sessionId)
++    if (tracked !== undefined && typeof tracked.prompt === 'string' && tracked.prompt.trim() !== '') {
++      prompt = tracked.prompt
++      timeStr = `（已运行 ${formatDuration(Date.now() - tracked.startedAt)}）`
++    }
++
++    // 2. 如果没有实时追踪，或者没有提问文本，读磁盘索引详情
++    if (prompt === '') {
++      const details = await readStoredSessionDetails(this.#home, sessionId)
++      if (details?.lastPrompt) {
++        prompt = details.lastPrompt
++      }
++      if (details?.lastPromptAt) {
++        const isRunning = await this.#isSessionRunning(sessionId)
++        timeStr = isRunning
++          ? `（已运行 ${formatDuration(Date.now() - details.lastPromptAt)}）`
++          : `（提问于 ${relativeTime(details.lastPromptAt)}）`
++      }
++    }
++
++    // 3. 处理 /new 或没有提问记录的新会话
++    if (prompt === '') {
++      if (/^已新建对话/.test(replyText)) {
++        await this.#send(conversationId, '这个会话最后一次提问：\n（新会话，暂无提问）')
++      }
++      return
++    }
++
++    const maxChars = this.#settings.finishPromptChars > 0 ? this.#settings.finishPromptChars : 60
++    const clipped = firstLine(prompt, maxChars) || prompt.slice(0, maxChars)
++    await this.#send(
++      conversationId,
++      `这个会话最后一次提问${timeStr}：\n${clipped}`,
++    )
++  }
++
++  /**
++   * `/run`：列出**此刻正在跑、还没完成**的任务。
++   *
++   * ## 排序
++   *
++   * 跑得越久的排越前（开始时间早的在前）——用户打开这一屏是想知道"哪个卡最久了"，
++   * 而不是"最近谁动过"。
++   *
++   * ## 每一条三行
++   *
++   * ```
++   * 1. 项目名
++   *    已运行 12 分 30 秒
++   *    把这段代码重构成三个文件
++   * ```
++   *
++   * ## 数据来源与它的诚实边界
++   *
++   * "是否在跑"来自宿主的 `sessionController.list()`（`running` 字段，实时状态）；
++   * "跑了多久 / 在跑什么"来自 `#runningSince`（本插件在提交提示词时记的）。
++   * 于是**插件启动之前就已经在跑的会话没有后两项**——那种情况显示"开始时间未知"，
++   * 而不是拿 `updatedAt` 编一个看起来合理的数字。
++   *
++   * @returns 回话文本。
++   */
++  async #handleRunCommand(text, conversationId) {
++    const raw = typeof text === 'string' ? text.trim() : ''
++    const lower = raw.toLowerCase()
++    // `/run` 与 `/run 3` 都归本指令；`/runs` 之类不归。
++    const match = /^\/run(?:\s+(\S+))?$/.exec(lower)
++    if (match === null) return undefined
++
++    const controller = this.#ctx.sessionController
++    if (typeof controller?.list !== 'function') {
++      return '这个版本的宿主不提供会话状态，/run 用不了。'
++    }
++
++    const rows = await this.#listSessionsSafe(controller)
++    if (rows === undefined) {
++      return '/run 查不到会话状态（宿主返回的形状不认识），详情见设置页的诊断日志。'
++    }
++
++    const running = rows.filter((row) => row?.running === true)
++    if (running.length === 0) return '现在没有正在跑的任务。'
++
++    // 会话详情从磁盘清单里取：含标题、最近提问文本与时间戳。
++    let detailsMap = new Map()
++    try {
++      const all = await this.#gateway().listSessions()
++      detailsMap = new Map(all.map((row) => [row.sessionId, row]))
++    } catch {
++      // 取不到详情不影响列表：下面会退回用会话 id。
++    }
++
++    const items = running.map((row) => {
++      const tracked = this.#runningSince.get(row.sessionId)
++      const detail = detailsMap.get(row.sessionId)
++      /*
++       * 开始时间按可靠度排序：
++       * 1. 本插件提交时记的（`#runningSince`）；
++       * 2. 宿主行里的 `lastPromptAt`（`promptAtFromRow`）；
++       * 3. 磁盘索引里的 `lastPromptAt`（`detail.lastPromptAt`）；
++       * 4. 都没有才报"未知"——绝不拿 `updatedAt` 冒充。
++       */
++      const startedAt = tracked?.startedAt ?? this.#promptAtFromRow(row) ?? detail?.lastPromptAt
++      const cwd = typeof row.cwd === 'string' && row.cwd !== '' ? row.cwd : this.#workspace
++      const prompt = tracked?.prompt || detail?.lastPrompt || detail?.title || ''
++      return {
++        sessionId: row.sessionId,
++        workspace: workspaceName(cwd),
++        elapsedMs: startedAt === undefined ? undefined : Date.now() - startedAt,
++        prompt,
++        title: detail?.title ?? '',
++      }
++    })
++
++    /*
++     * ★ 提问内容仍为空时，**逐条去磁盘补**。
++     *
++     * 真实故障：`/run 1` 切进去后显示「最后一次提问：（内容未知）」。
++     * 原因是 `detailsMap` 由 `gateway().listSessions()` 建立，而它遍历的是
++     * **会话目录**；某些会话（刚 fork 出来、或索引行被驱逐过）会出现在宿主的
++     * `list()` 里却不在那份目录清单中，于是 `detail` 是 undefined。
++     *
++     * `readStoredSessionDetails` 直接按 sessionId 去投影缓存里取，不依赖目录遍历，
++     * 所以能补上这一块。只在**真的缺**的时候读，不给清单路径增加成本。
++     */
++    for (const item of items) {
++      if (item.prompt !== '') continue
++      try {
++        const details = await readStoredSessionDetails(this.#home, item.sessionId)
++        if (details?.lastPrompt) item.prompt = details.lastPrompt
++        if (item.title === '' && details?.title) item.title = details.title
++      } catch {
++        // 补不到就保持"内容未知"，不编造。
++      }
++    }
++
++    /*
++     * 排序：有开始时间的按时间**升序**（跑得久的在前）；
++     * 没有开始时间的（插件启动前就在跑）排在最后。
++     */
++    items.sort((a, b) => {
++      if (a.elapsedMs === undefined && b.elapsedMs === undefined) return 0
++      if (a.elapsedMs === undefined) return 1
++      if (b.elapsedMs === undefined) return -1
++      return b.elapsedMs - a.elapsedMs
++    })
++
++    const arg = match[1]
++    if (arg === undefined) return this.#renderRunList(items)
++
++    /*
++     * `/run <序号>`：切到那个会话。
++     *
++     * ## 越界一律落到最后一个
++     *
++     * 用户明确要求：`0`、以及任何超过数量的数字，都切到**末尾**那个（跑得最短的）。
++     * 这条规则是为了"顺手打一个数"不会得到一句错误——手机上多打一位、少打一位是常态，
++     * 而回一句"没有第 5 个"除了让人重打一次之外没有任何用处。
++     */
++    if (!/^\d+$/.test(arg)) {
++      return `看不懂「${arg}」。用法：/run 看清单，/run 1 切到第 1 个。`
++    }
++    const requested = Number(arg)
++    // 1 基编号：1 = 跑得最久的。0 与超界都落到最后一个。
++    const index =
++      requested >= 1 && requested <= items.length ? requested - 1 : items.length - 1
++    const target = items[index]
++    if (target === undefined) return this.#renderRunList(items)
++
++    return await this.#switchToRunning(conversationId, target, index, items.length)
++  }
++
++  /**
++   * 渲染 `/run` 的清单。
++   *
++   * @param items - 已排序的在跑任务。
++   * @returns 回话文本。
++   */
++  #renderRunList(items) {
++    const blocks = items.map((item, index) => {
++      const elapsed =
++        item.elapsedMs === undefined ? '开始时间未知' : `已运行 ${formatDuration(item.elapsedMs)}`
++      const question = firstLine(item.prompt) || item.title || '（内容未知）'
++      return [`${String(index + 1)}. ${item.workspace}`, elapsed, question].join('\n')
++    })
++    return (
++      `正在跑的任务（${String(items.length)} 个）\n\n${blocks.join('\n\n')}\n\n` +
++      '回 /run 序号 切过去。'
++    )
++  }
++
++  /**
++   * 把 QQ 对话切到某个正在跑的会话，并**把它的最后一次提问发出来**。
++   *
++   * ## 为什么要重发提问
++   *
++   * 切过去之后，用户在手机上看到的是一片空白（历史在电脑上）。他不知道这个会话
++   * 在干什么、刚问过什么，于是第一条消息往往要花在"这是哪个"上。
++   * 把最后一次提问贴出来，等于给这条对话一个可见的开头。
++   *
++   * ## 不改名
++   *
++   * 与 `/switch` 同一条：采纳一条已有会话不该动它的标题。
++   *
++   * @param conversationId - QQ 对话。
++   * @param target - 目标会话（`items` 里的一项）。
++   * @param index - 它在清单里的位置（0 基）。
++   * @param total - 清单长度。
++   * @returns 回话文本。
++   */
++  async #switchToRunning(conversationId, target, index, total) {
++    try {
++      await this.#adoptSession(target.sessionId)
++    } catch (error) {
++      this.#recordError(`/run 切换采纳失败: ${describeError(error)}`)
++      return `/run 切换失败：${describeError(error)}`
++    }
++
++    const state = await this.#store.read()
++    const previous = state.bindings[conversationId]
++    try {
++      await this.#store.update((next) => {
++        next.bindings[conversationId] = {
++          conversationId,
++          accountId: previous?.accountId ?? this.#appId,
++          peerId: previous?.peerId ?? '',
++          sessionId: target.sessionId,
++          // 三级回退，与 `router.js` 的 `#switchTo` 一致：目标标题 → 原标题 → 前缀。
++          title: target.title || previous?.title || TITLE_PREFIX,
++          createdAt: previous?.createdAt ?? Date.now(),
++          lastUsedAt: Date.now(),
++        }
++      })
++    } catch (error) {
++      this.#recordError(`/run 切换绑定失败: ${describeError(error)}`)
++      return `/run 切换失败：${describeError(error)}`
++    }
++
++    /*
++     * ★ 让路由丢掉绑定缓存。
++     *
++     * 不调这一步，`/list` 与 `/current` 会继续报**原来那个会话**——
++     * 它们读的是路由的缓存，而这里直接写了盘。用户看到"切了但没切"。
++     */
++    this.#router?.invalidateBindings()
++
++    bootLog(
++      `/run: 切到第 ${String(index + 1)}/${String(total)} 个在跑会话 ${target.sessionId}`,
++    )
++
++    const elapsed =
++      target.elapsedMs === undefined ? '开始时间未知' : `已运行 ${formatDuration(target.elapsedMs)}`
++    const question = firstLine(target.prompt) || target.title || '（内容未知）'
++    return [
++      `已切到第 ${String(index + 1)}/${String(total)} 个：${target.workspace}`,
++      elapsed,
++      '',
++      '最后一次提问：',
++      question,
++    ].join('\n')
++  }
++
++  /**
++   * `/notify` 指令：查看或切换「任何会话结束都推送到 QQ」。
++   *
++   * 支持的写法（手机键盘掉空格是常态，所以分隔符可选）：
++   *
++   * | 输入 | 行为 |
++   * |---|---|
++   * | `/notify` | 报告当前状态 |
++   * | `/notify on` / `/notify 开` / `/notify 1` | 打开 |
++   * | `/notify off` / `/notify 关` / `/notify 0` | 关闭 |
++   *
++   * 返回 `undefined` 表示"这不是本指令"，调用方继续走路由。
++   * 返回字符串表示"这是本指令，回这句话"。
++   *
++   * @param text - 用户原文。
++   * @returns 回话文本，或 `undefined`。
++   */
++  async #handleNotifyCommand(text) {
++    const trimmed = typeof text === 'string' ? text.trim() : ''
++    const lower = trimmed.toLowerCase()
++    if (!lower.startsWith('/notify')) return undefined
++    const rest = trimmed.slice('/notify'.length)
++
++    /*
++     * 解析参数，两种情况：
++     * - 带分隔符：`/notify on`、`/notify:on`、`/notify：开`（冒号接受中英文）
++     * - 无分隔符：`/notifyon`、`/notify开`——手机键盘掉空格是常态，
++     *   与 `/switch1` 同一种考虑。
++     *
++     * ⚠️ 无分隔符时必须**整体**是一个已知词，否则 `/notifications` 会被
++     * 吃成 `on` 加 `ifications`，用户想打的别的指令就没了。所以粘连部分
++     * 不在词表里时，这里交回路由（返回 undefined），而不是报错。
++     */
++    let arg
++    if (rest === '') {
++      arg = ''
++    } else if (/^[\s:：]/.test(rest)) {
++      arg = rest.replace(/^[\s:：]+/, '').trim().toLowerCase()
++    } else {
++      const glued = rest.trim().toLowerCase()
++      if (!ON_WORDS.has(glued) && !OFF_WORDS.has(glued)) return undefined
++      arg = glued
++    }
++
++    const stateLine = (on) =>
++      on
++        ? '「任何会话结束都推送」现在是**开**的：你在电脑上开的任何会话跑完，结果都会发到这个 QQ。'
++        : '「任何会话结束都推送」现在是**关**的：只有切进去的会话（/switch）或任务自己调 notify_qq 才会发到这里。'
++
++    if (arg === '') {
++      const on = this.#settings.notifyAllSessions === true
++      return `${stateLine(on)}\n\n切换：/notify on  或  /notify off`
++    }
++
++    const isOn = ON_WORDS.has(arg)
++    const isOff = OFF_WORDS.has(arg)
++    if (!isOn && !isOff) {
++      return `看不懂「${arg}」。用 /notify on 或 /notify off。`
++    }
++
++    this.applySettings({ notifyAllSessions: isOn })
++    bootLog(`/notify: notifyAllSessions -> ${String(isOn)}`)
++    return `${stateLine(isOn)}\n\n已保存，重启后仍然有效。`
++  }
++
++  /**
++   * 把**未绑定会话**的收尾结果转发到 QQ（`notifyAllSessions` 打开时）。
++   *
++   * ## 为什么要单独一个缓冲表
++   *
++   * `#replies` 的条目带 `conversationId`，而这里在收尾之前根本不知道要发给谁
++   * （目标由 `#boundConversation()` 在收尾那一刻解析）。更重要的是：
++   * 绑定会话与未绑定会话可能**同时**在跑，用同一张表会让两边的旁白区互相污染。
++   * 所以另开 `#unboundReplies`，键仍然是 sessionId。
++   *
++   * ## 判据与绑定会话完全一致
++   *
++   * 出现过工具调用的 attempt 是过程旁白，压住不发并记进旁白区；
++   * 只有"没有工具调用"的 attempt 才是真收尾，此时只发它自己的正文。
++   * 否则打开这个开关就等于把用户淹在进度刷屏里——那正是它最该避免的结果。
++   *
++   * @param sessionId - 会话 id。
++   * @param frame.text - 本帧正文。
++   * @param frame.completed - 是否 end 帧。
++   * @param frame.toolCall - 本帧的工具调用（有则证明还在干活）。
++   */
++  async #forwardUnbound(sessionId, { text, completed, toolCall }) {
++    const existing = this.#unboundReplies.get(sessionId)
++    const entry = existing ?? { text: '', sawTool: false, narrationLen: 0, pushed: false }
++    if (text !== undefined) entry.text += text
++    if (toolCall !== undefined) entry.sawTool = true
++
++    if (completed !== true) {
++      this.#unboundReplies.set(sessionId, entry)
++      return
++    }
++
++    if (entry.sawTool === true) {
++      // 还在干活：把已累积的正文划为旁白区，等真正的收尾。
++      entry.narrationLen = entry.text.length
++      entry.sawTool = false
++      this.#unboundReplies.set(sessionId, entry)
++      return
++    }
++
++    /*
++     * 真收尾。先清缓冲——下面任何一条 return 都不该让这段正文留在表里，
++     * 否则下一次该会话的收尾会把它重复带上。
++     */
++    this.#unboundReplies.delete(sessionId)
++
++    const finalText = entry.text.slice(entry.narrationLen).trim()
++    /*
++     * 没有收尾正文就不推。
++     *
++     * 这是刻意的：模型有时以纯工具调用收尾（比如刚发完一个文件），
++     * 此时正文是空的，硬推只会是一条空白消息。绑定会话那边退回"发全部正文"，
++     * 是因为那里用户在等回答；而这里是**额外**转发，没有正文就该安静。
++     */
++    if (finalText === '') return
++
++    const conversationId = await this.#boundConversation()
++    if (conversationId === undefined) {
++      recordOnce(
++        this.#seen,
++        `#unboundNoTarget:${sessionId}`,
++        `未绑定会话 ${sessionId} 有结果要转发，但当前没有任何 QQ 对话绑定，无法投递`,
++      )
++      return
++    }
++
++    /*
++     * 与 `notify_qq` 的跨会话开关一致：关掉 `allowCrossSessionNotify` 时，
++     * 未绑定会话的自动转发也一并停掉——那是同一个安全姿态，不该留一个后门。
++     */
++    if (!this.#settings.allowCrossSessionNotify) {
++      recordOnce(
++        this.#seen,
++        `#unboundCrossNotifyOff:${sessionId}`,
++        `未绑定会话 ${sessionId} 有结果要转发，但「允许其他会话推送到 QQ」是关闭的，已跳过`,
++      )
++      return
++    }
++
++    try {
++      /*
++       * 推送内容 = 提问 + 分隔线 + 结果。
++       *
++       * 只发结果的话，用户看到"完成了"却想不起问的是什么——尤其在同时跑好几个
++       * 任务的时候。提问取本插件记下的**用户原话**（`#runningSince`），
++       * 截到 `finishPromptChars` 字，超过加省略号。
++       *
++       * 提问拿不到时（插件启动前就在跑）只发结果，**不编一个占位符**：
++       * 一句"（提问未知）"对用户没有任何信息量，只会占掉三行。
++       */
++      const question = this.#finishedQuestion(sessionId)
++      const body =
++        question === '' ? finalText : `${question}\n${FINISH_SEPARATOR}\n${finalText}`
++      await this.#deliverOrQueue(conversationId, { text: body })
++      /*
++       * 记下"刚跑完的是谁"，供 `rrr` 回话。
++       *
++       * 位置在**投递成功之后**：推送没送到的话，用户根本看不到那条消息，
++       * 也就不会想到去 `rrr`；此时把目标改掉只会让下一次 `rrr` 打偏。
++       */
++      await this.#rememberFinished(sessionId)
++      bootLog(
++        `notifyAllSessions: 未绑定会话 ${sessionId} 的结果已转发（${String(finalText.length)} 字）`,
++      )
++    } catch (error) {
++      this.#recordError(`未绑定会话结果转发失败: ${describeError(error)}`)
++    }
++  }
++
++  /**
++   * 取出某个会话**这一轮**的提问，压成推送里那一行。
++   *
++   * 来源是 `#runningSince`（本插件在提交提示词时记的用户原话）。
++   * 拿不到就返回空串——调用方据此只发结果，不编占位符。
++   *
++   * @param sessionId - 刚收尾的会话。
++   * @returns 一行提问，可能为空串。
++   */
++  #finishedQuestion(sessionId) {
++    const tracked = this.#runningSince.get(sessionId)
++    if (tracked === undefined) return ''
++    return clipQuestion(tracked.prompt, this.#settings.finishPromptChars)
++  }
++
++  /**
++   * 记住"刚跑完任务"的会话，供 `rrr` 回话。
++   *
++   * 标题尽力取：取不到就留空串——`rrr` 的确认语用得到它，但**不是**它决定发给谁。
++   *
++   * @param sessionId - 刚收尾的会话。
++   */
++  async #rememberFinished(sessionId) {
++    /*
++     * 这一轮结束了，`/run` 不该再把它算进"正在跑"。
++     *
++     * 清在这里而不是别处，是因为它同时覆盖两条收尾路径：绑定会话的 `#flushReply`
++     * 与未绑定会话的 `#forwardUnbound`。两处都调用本方法。
++     */
++    this.#runningSince.delete(sessionId)
++
++    let title = ''
++    try {
++      const all = await this.#gateway().listSessions()
++      const row = all.find((item) => item.sessionId === sessionId)
++      if (row !== undefined && typeof row.title === 'string') title = row.title
++    } catch {
++      // 取标题失败不影响 `rrr`：目标由 sessionId 决定。
++    }
++    try {
++      await this.#store.update((next) => {
++        next.lastFinished = { sessionId, title, at: Date.now() }
++      })
++    } catch (error) {
++      this.#recordError(`记录最近完成的会话失败: ${describeError(error)}`)
++    }
++  }
++
++  /**
++   * 发出并清空某会话缓冲的回复。
++   *
++   * @param sessionId - 会话 id。
++   * @param overrideText - 可选：只发这段文本（本地补丁用来跳过旁白区）。
++   *   省略时发整个缓冲区。
++   */
++  async #flushReply(sessionId, overrideText) {
++    const entry = this.#replies.get(sessionId)
++    // 没有缓冲（别处已经发过 / 定时器与回合结束撞在一起）**不是丢东西**：
++    // 下面那个 `text === ''` 同理——两处都无事可做，所以刻意不记日志。
++    if (entry === undefined) return
++    /*
++     * ★ 本地补丁：静默窗口到期时，若这一轮用过工具，**不要发**。
++     *
++     * 定时器本来是给"非 end 帧"准备的：模型输出一段话后停顿一下就发出去。
++     * 但在 agentic 循环里那段话往往是"现在读一下某个文件"这类过程旁白，
++     * 而工具调用证明任务还没完。所以这里与 end 帧用同一条判据。
++     *
++     * 注意 `overrideText` 有值时不走这条——那是 end 帧显式要求发送的收尾正文。
++     */
++    if (entry.sawTool === true && overrideText === undefined) return
++    this.#replies.delete(sessionId)
++    const text = (overrideText ?? entry.text).trim()
++    if (text === '') return
++    await this.#sendReply(entry.conversationId, text)
++  }
++
++  /**
++   * 发送一条**回复**，超长时降级为文件。
++   *
++   * 移植自微信的 `maxReplyChars`。不降级的话，一条上万字的回复会被
++   * `TEXT_CHUNK_LIMIT` 切成好几条消息刷屏——手机上要连划好几屏，
++   * 而且中间那几条读起来是断的。
++   *
++   * 微信的原话同样适用：先给一句 caption，**免得文件变成一个没有说明的附件**。
++   * 文件写进媒体目录，所以用户在电脑上也能找到它。
++   *
++   * @param conversationId - 对话键。
++   * @param text - 已 trim 的回复正文。
++   */
++  async #sendReply(conversationId, text) {
++    const plan = planReply(text, this.#settings.maxReplyChars)
++    if (plan.kind === 'send') {
++      const rendered = this.#renderForQq(plan.text)
++      if (rendered === undefined) {
++        // `markdownMode === 'file'` 且这条含 Markdown：改成发附件。
++        await this.#send(conversationId, '回复含格式，已作为 .md 文件发送。')
++        await this.#sendMarkdownFile(conversationId, plan.text)
++        return
++      }
++      await this.#send(conversationId, rendered)
++      return
++    }
++    /*
++     * 长回复走文件：**保留原始 Markdown**，不做纯文本转换。
++     *
++     * 这正是"转成 .md 文件"的意义——手机上点开能看到渲染后的排版，
++     * 而纯文本转换会把表格和层级压平。用户选 `file` 模式时走的也是这条路。
++     */
++    await this.#send(conversationId, plan.caption)
++    await this.#sendMarkdownFile(conversationId, plan.text)
++  }
++
++  /**
++   * 按 `markdownMode` 决定一条**短回复**怎么发。
++   *
++   * | 模式 | 行为 |
++   * |---|---|
++   * | `plain` | 转纯文本（默认）。QQ 不渲染 Markdown，原样发出去是一堆井号 |
++   * | `raw` | 原样返回（上游行为） |
++   * | `file` | 有 Markdown 就返回 `undefined`，调用方改为发 `.md` 文件 |
++   *
++   * @param text - 回复正文。
++   * @returns 要发送的文本；`undefined` 表示"这条应该走文件"。
++   */
++  #renderForQq(text) {
++    const mode = this.#settings.markdownMode
++    if (mode === 'raw') return text
++    if (mode === 'file') {
++      // 没有 Markdown 就别发附件：纯文本消息比一个附件好用得多。
++      return hasMarkdown(text) ? undefined : text
++    }
++    // plain：只在真的含标记时转换，避免在无关内容上产生意外改动。
++    return hasMarkdown(text) ? markdownToPlain(text) : text
++  }
++
++  /**
++   * 把一段 Markdown 写成 `.md` 文件发给用户。
++   *
++   * 写不进去或发不出去时**退回纯文本消息**，而不是让这条回复消失。
++   *
++   * @param conversationId - 对话键。
++   * @param markdown - 原始 Markdown。
++   */
++  async #sendMarkdownFile(conversationId, markdown) {
+     const name = longReplyFileName()
+     const path = join(this.#mediaDir(), name)
+     try {
+-      writeFileSync(path, plan.text, 'utf8')
++      writeFileSync(path, markdown, 'utf8')
+     } catch (error) {
+-      // 写不进去时**退回到分条发送**，而不是让这条回复消失。
+-      this.#recordError(`长回复写文件失败，改为分条发送: ${describeError(error)}`)
+-      await this.#send(conversationId, plan.text)
++      this.#recordError(`Markdown 写文件失败，改为纯文本: ${describeError(error)}`)
++      await this.#send(conversationId, markdownToPlain(markdown))
+       return
+     }
+     try {
+       await this.#sendFile(conversationId, path)
+-      bootLog(`长回复 ${String(plan.text.length)} 字 -> ${name}`)
++      bootLog(`Markdown ${String(markdown.length)} 字 -> ${name}`)
+     } catch (error) {
+-      this.#recordError(`长回复发送文件失败，改为分条发送: ${describeError(error)}`)
+-      await this.#send(conversationId, plan.text)
++      this.#recordError(`Markdown 发送文件失败，改为纯文本: ${describeError(error)}`)
++      await this.#send(conversationId, markdownToPlain(markdown))
+     }
+   }
+ 

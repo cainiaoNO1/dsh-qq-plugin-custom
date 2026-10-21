@@ -1,0 +1,130 @@
+# 改造 3,6,10 | 文件: lib/settings.js
+# 基线: dsh-qq-plugin@1.0.3
+warning: in the working copy of 'C:/Users/yuanmingjie/AppData/Local/Temp/upstream-qq/package/lib/settings.js', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'C:/Users/yuanmingjie/.dsh/profiles/web/node_modules/dsh-qq-plugin/lib/settings.js', LF will be replaced by CRLF the next time Git touches it
+diff --git a/lib/settings.js b/lib/settings.js
+index 51314a8..7155f9e 100644
+--- a/lib/settings.js
++++ b/lib/settings.js
+@@ -76,6 +76,24 @@ function isString(value) {
+   return typeof value === 'string' ? value : undefined
+ }
+ 
++/**
++ * Markdown 处理模式的合法取值。
++ *
++ * 表外的值一律丢弃（保持原值）——与其它校验器同一条语义。
++ * 硬编码这三个是因为它们是**本插件自己的行为分支**，不像权限预设那样由部署方配置。
++ */
++const MARKDOWN_MODES = new Set(['plain', 'raw', 'file'])
++
++/**
++ * 校验 Markdown 处理模式。
++ *
++ * @param value - 候选值。
++ * @returns 合法模式，或 `undefined`（保持原值）。
++ */
++function isMarkdownMode(value) {
++  return typeof value === 'string' && MARKDOWN_MODES.has(value) ? value : undefined
++}
++
+ /**
+  * 渠道上下文说明的默认值，移植自微信插件，措辞按 QQ 改写。
+  *
+@@ -115,6 +133,26 @@ export const SETTINGS_SCHEMA = {
+   requireConfirmation: { normalize: isBoolean, default: true },
+   /** 是否允许任意会话主动推送到当前绑定的对话。 */
+   allowCrossSessionNotify: { normalize: isBoolean, default: true },
++  /**
++   * 本地扩展：任何会话的回合结束时，是否把结果也推到 QQ。
++   *
++   * ## 为什么需要它
++   *
++   * 默认行为是「只有绑定的那个会话才送」。于是用户在桌面端开的会话跑完一个长任务，
++   * 结果只留在那台电脑上，手机上什么也收不到——除非事先切进去，或者让 agent
++   * 自己调 `notify_qq`。而"我出门前让它跑个任务，回来看手机"恰恰是这类遥控器最该支持的场景。
++   *
++   * ## 为什么默认关闭
++   *
++   * 打开后**所有**会话的结果都会往手机推，包括随口试的一句、跑到一半放弃的、
++   * 以及桌面上正在看的那个。那不是"更多信息"，而是噪音——而且会让人误以为
++   * 手机上的东西都是自己要的。所以默认保持上游的保守姿态，由用户显式打开。
++   *
++   * 打开后仍**跳过**两种情况（见 `runtime.onAssistantFrame`）：
++   * 1. 该会话本身就绑定着某个 QQ 对话（那本来就会送，不能送两遍）；
++   * 2. 本轮已经有 `notify_qq` 推过（否则同一条结果会到两次）。
++   */
++  notifyAllSessions: { normalize: isBoolean, default: false },
+   /** 回复聚合的静默窗口（毫秒）：连续流片段之间等这么久没有新片段就发出去。 */
+   settleMs: { normalize: (value) => boundedNumber(value, CEILING_MS), default: 1_200 },
+   /**
+@@ -146,6 +184,69 @@ export const SETTINGS_SCHEMA = {
+    * 而生效的那个路径从 `status.workspace` 看。
+    */
+   workspacePath: { normalize: isString, default: '' },
++  /**
++   * 本地扩展：「快速对话」目录（`111` 前缀的消息发到这里的最新会话）。
++   *
++   * ## 与 `workspacePath` 的区别
++   *
++   * `workspacePath` 是**本频道**的工作目录——当前绑定的那个 QQ 对话的消息都落在那。
++   * 本项是**旁路**：`111 你好` 把「你好」发到这个目录下的最新会话，
++   * 而**当前绑定保持不变**——用户接下来正常说话，还是回到原来那个会话。
++   *
++   * 所以它解决的是"顺手问一句、不想污染当前对话"，不是"换一个工作区"。
++   *
++   * ## 空串 = 关闭
++   *
++   * 未设置时 `111 你好` 被当成**普通文本**原样交给 agent（用户明确要求的行为）。
++   * 这与 `workspacePath` 的"空串 = 用默认"不同：这里空串就是**不启用**。
++   *
++   * ## 目录由插件创建，DSH 工作区由用户建
++   *
++   * 目录走 `resolveWorkspaceDir`（会 mkdir + 写探针，见 `paths.js`）；
++   * 但 DSH 工作区是宿主的账本，插件不代劳——用户自己在设置里建并选中。
++   */
++  quickWorkspacePath: { normalize: isString, default: '' },
++  /**
++   * 本地扩展：QQ 消息里 Markdown 怎么处理。
++   *
++   * ## 为什么需要
++   *
++   * **QQ 消息不渲染 Markdown。** agent 输出的是 Markdown，于是手机上看到的
++   * 是一堆井号、竖线、星号——用户直接截图报了这个问题。
++   *
++   * ## 三个取值
++   *
++   * | 值 | 行为 |
++   * |---|---|
++   * | `plain`（默认） | 转成纯文本再发。表格变缩进列表，其余保留结构 |
++   * | `raw` | 原样发送（上游行为）。想要原始标记时用 |
++   * | `file` | 只要有 Markdown 就写成 `.md` 附件发送，手机上点开能看到渲染效果 |
++   *
++   * ## 长回复不受影响
++   *
++   * 超过 `maxReplyChars` 的回复**始终**走 `.md` 文件（见 `planReply`），
++   * 与这一项无关——那条路径本来就保留完整 Markdown。
++   */
++  markdownMode: { normalize: isMarkdownMode, default: 'plain' },
++  /**
++   * 本地扩展：会话完成推送里，提问最多显示多少字。
++   *
++   * ## 为什么需要
++   *
++   * `notifyAllSessions` 打开后，推送只有结果。用户看到一条"完成了"，却想不起
++   * 当初问的是什么——尤其在同时跑好几个任务的时候。
++   *
++   * ## 为什么默认 60
++   *
++   * 手机上一行大约 20 个汉字，60 字是三行：够认出是哪件事，又不至于把推送
++   * 撑成一篇。超过就截断加省略号——**不做折行保留**，因为提问是"索引"不是正文。
++   *
++   * `0` 表示不显示提问（只要结果）。
++   */
++  finishPromptChars: {
++    normalize: (value) => boundedNumber(value, CEILING_CHARS),
++    default: 60,
++  },
+ }
+ 
+ /**

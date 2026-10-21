@@ -1,0 +1,9 @@
+# 强制 LF 行尾——补丁与上游包都按 LF 存储。
+# 缺了这条，Windows 上的 git 会把 .js 转成 CRLF，
+# 于是 `git apply` 出来的文件与上游逐字节不同（实测差 4790 处），
+# 补丁校验会全部"看起来冲突"而实际内容是对的。
+* text=auto eol=lf
+
+# 补丁本身必须是二进制安全的：不要让 git 改写它的空白。
+*.patch -text
+*.tgz binary

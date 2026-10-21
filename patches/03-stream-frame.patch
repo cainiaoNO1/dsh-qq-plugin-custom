@@ -1,0 +1,67 @@
+# 改造 1 | 文件: lib/stream-frame.js
+# 基线: dsh-qq-plugin@1.0.3
+warning: in the working copy of 'C:/Users/yuanmingjie/AppData/Local/Temp/upstream-qq/package/lib/stream-frame.js', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'C:/Users/yuanmingjie/.dsh/profiles/web/node_modules/dsh-qq-plugin/lib/stream-frame.js', LF will be replaced by CRLF the next time Git touches it
+diff --git a/lib/stream-frame.js b/lib/stream-frame.js
+index da70245..51c851e 100644
+--- a/lib/stream-frame.js
++++ b/lib/stream-frame.js
+@@ -71,17 +71,51 @@ export function readStreamFrame(payload) {
+       return typeof chunk.text === 'string' ? { ...withId, text: chunk.text } : withId
+ 
+     case 'tool-call-delta': {
+-      // 观测事实：这个帧带 `type,index,id,argumentsDelta`，**不带工具名**——
+-      // 所以工具名只在 `block-start` 上出现（见 `docs/HOST-STREAM-SHAPES.md`）。
++      /*
++       * ⚠️ 本地补丁：**这里曾经是判据失效的根源**。
++       *
++       * 原代码要求 `chunk.name` 是字符串才返回 `toolCall`：
++       *
++       *     const name = typeof chunk.name === 'string' ? chunk.name : undefined
++       *     if (id === undefined || name === undefined || name === '') return withId
++       *
++       * 而宿主的 `tool-call-delta` **不带工具名**（`dsh-llm` 的
++       * `AssistantStreamAccumulator.push` 里，`name` 是可选字段，
++       * 实际流量里只在极少数情况下出现；`docs/HOST-STREAM-SHAPES.md` 也写明了这一点）。
++       * 于是 `name` 恒为 `undefined`，这个分支**永远返回 `withId`**——
++       * `toolCall` 从未被设置过。
++       *
++       * 后果：任何靠 `toolCall !== undefined` 判断"这一轮用过工具"的逻辑
++       * （包括本插件的旁白过滤）**从来没有生效过**。
++       *
++       * 现在改为：只要 `id` 存在就认为是工具调用，名字有就带上、没有就留空。
++       * 名字本来就只有 `block-start` 才知道（见下面的分支）。
++       */
+       const id = typeof chunk.id === 'string' ? chunk.id : undefined
+-      const name = typeof chunk.name === 'string' ? chunk.name : undefined
+-      if (id === undefined || name === undefined || name === '') return withId
+-      return { ...withId, toolCall: { id, name } }
++      if (id === undefined || id === '') return withId
++      const name = typeof chunk.name === 'string' && chunk.name !== '' ? chunk.name : undefined
++      return { ...withId, toolCall: name === undefined ? { id } : { id, name } }
++    }
++
++    case 'block-start': {
++      /*
++       * ★ 工具名的**唯一**来源（本地补丁新增的识别）。
++       *
++       * `block-start` 带 `{ type, index, blockType }`，而 `blockType === 'tool-call'`
++       * 就是一个比 `tool-call-delta` 更早、更确定的"这一轮要用工具"信号——
++       * 它在工具参数开始流式传输**之前**就到达了。
++       *
++       * 所以这里也返回 `toolCall`（不带名字，名字本帧也没有），
++       * 让上层能在第一时刻就把这一轮标记为"还在干活"。
++       */
++      if (chunk.blockType === 'tool-call') {
++        return { ...withId, toolCall: { id: `block-${String(chunk.index ?? 0)}` } }
++      }
++      return withId
+     }
+ 
+-    case 'block-start':
+     case 'block-end':
+-      // 工具块的边界帧。它们不承载用户可见文本。
++      // 工具块的结束边界帧。它不承载用户可见文本。
+       return withId
+ 
+     default:

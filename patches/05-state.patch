@@ -1,0 +1,78 @@
+# 改造 8,9 | 文件: lib/state.js
+# 基线: dsh-qq-plugin@1.0.3
+warning: in the working copy of 'C:/Users/yuanmingjie/AppData/Local/Temp/upstream-qq/package/lib/state.js', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'C:/Users/yuanmingjie/.dsh/profiles/web/node_modules/dsh-qq-plugin/lib/state.js', LF will be replaced by CRLF the next time Git touches it
+diff --git a/lib/state.js b/lib/state.js
+index 2c6b5d8..7198289 100644
+--- a/lib/state.js
++++ b/lib/state.js
+@@ -128,6 +128,27 @@ export function emptyState() {
+      * 见 `pending.js`：**"发不出去"和"丢掉"是两回事**。
+      */
+     pendingNotifications: [],
++    /**
++     * 最近一个**跑完任务**的会话，供 `rrr` 回话用。
++     *
++     * 形状：`{ sessionId, title, at }`，没有时是 `null`。
++     *
++     * **必须持久化**：`rrr` 的语义是"回话给刚跑完的那个会话"，而用户看到推送、
++     * 再切到 QQ 打字之间可能隔着几分钟，甚至中间 DSH 重启过一次。
++     * 只放内存的话，重启后 `rrr` 就不知道指谁——而那时用户看到的推送还在聊天记录里，
++     * 他会以为这个功能坏了。
++     */
++    lastFinished: null,
++    /**
++     * conversationId → 待用户抉择的"目标会话正在忙"请求。
++     *
++     * 形状：`{ sessionId, text, mode, at }`，`mode` 是 `'bound' | 'quick' | 'rrr'`。
++     *
++     * **必须持久化**：用户收到"选 1/2/3/0"的提示后，可能过几分钟才回。
++     * 只放内存的话，中间重启一次那个提示就变成一个再也答不了的悬案——
++     * 而用户手里还留着那条消息，他会照着回数字，然后被当成普通对话发出去。
++     */
++    pendingBusy: {},
+     /** 是否在启动时自动重连。 */
+     autoStart: true,
+   }
+@@ -149,6 +170,41 @@ export function normalizeState(value) {
+ 
+   if (typeof record.autoStart === 'boolean') state.autoStart = record.autoStart
+ 
++  /*
++   * `lastFinished`：`rrr` 的目标。
++   *
++   * 只接受形状完整的记录——`sessionId` 是它唯一承重的字段，
++   * 缺了它这条记录什么也指不了，留着只会让 `rrr` 回一句"找不到会话"。
++   */
++  const finished = record.lastFinished
++  if (typeof finished === 'object' && finished !== null && typeof finished.sessionId === 'string') {
++    state.lastFinished = {
++      sessionId: finished.sessionId,
++      title: typeof finished.title === 'string' ? finished.title : '',
++      at: typeof finished.at === 'number' ? finished.at : 0,
++    }
++  }
++
++  /*
++   * `pendingBusy`：等着用户选 1/2/3/0 的请求。
++   *
++   * 逐条过滤而不是整体信任：一条坏记录不该让其余待答提示一起消失。
++   * `text` 是用户的原话，缺了它这个提示就没有意义（选项都是"对这句话做什么"）。
++   */
++  if (typeof record.pendingBusy === 'object' && record.pendingBusy !== null) {
++    for (const [conversationId, raw] of Object.entries(record.pendingBusy)) {
++      if (typeof raw !== 'object' || raw === null) continue
++      const item = raw
++      if (typeof item.sessionId !== 'string' || typeof item.text !== 'string') continue
++      state.pendingBusy[conversationId] = {
++        sessionId: item.sessionId,
++        text: item.text,
++        mode: typeof item.mode === 'string' ? item.mode : 'bound',
++        at: typeof item.at === 'number' ? item.at : 0,
++      }
++    }
++  }
++
+   // 待发队列：逐条过滤，坏条目丢掉而不是整体拒绝——一条坏记录不该让所有待发消息消失。
+   state.pendingNotifications = normalizePending(record.pendingNotifications)
+ 

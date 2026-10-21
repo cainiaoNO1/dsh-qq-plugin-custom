@@ -1,0 +1,161 @@
+# 改造 4,11,12 | 文件: lib/router.js
+# 基线: dsh-qq-plugin@1.0.3
+warning: in the working copy of 'C:/Users/yuanmingjie/AppData/Local/Temp/upstream-qq/package/lib/router.js', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'C:/Users/yuanmingjie/.dsh/profiles/web/node_modules/dsh-qq-plugin/lib/router.js', LF will be replaced by CRLF the next time Git touches it
+diff --git a/lib/router.js b/lib/router.js
+index 55c77c9..23df3ff 100644
+--- a/lib/router.js
++++ b/lib/router.js
+@@ -458,7 +458,11 @@ export class SessionRouter {
+           if (binding === undefined) {
+             return { kind: 'reply', text: '当前没有对话，先发一条消息再切模型。' }
+           }
+-          return { kind: 'reply', text: renderModelList(models, current) }
++          return {
++            kind: 'reply',
++            text: renderModelList(models, current),
++            browse: { level: 'models', workspace: '', page: 1, at: Date.now() },
++          }
+         }
+ 
+         const target = resolveModel(args, models)
+@@ -469,32 +473,7 @@ export class SessionRouter {
+         if (binding === undefined) {
+           return { kind: 'reply', text: '当前没有对话，先发一条消息再切模型。' }
+         }
+-        if (this.#gateway.selectModel === undefined) {
+-          return { kind: 'reply', text: '当前组合不支持切换模型。' }
+-        }
+-        try {
+-          /*
+-           * 模型自己声明的默认等级**随选择一起交下去**（微信同一条注释）：
+-           * 不交的话，"用哪个等级"就交给了一个用户看不见的解析步骤，
+-           * 而同一个模型在不同等级上是两个不同的回答。
+-           */
+-          const selected = await this.#gateway.selectModel(
+-            binding.sessionId,
+-            target.provider,
+-            target.model,
+-            target.defaultLevel,
+-          )
+-          const name = modelLabel(selected ?? target)
+-          const label = levelName(selected?.reasoningEffort, target.levels ?? [])
+-          const lines = [`已切换模型：${name}。`]
+-          if (label !== undefined) lines.push(`推理等级：${label}`)
+-          lines.push('', '对下一步生效，正在跑的那一步不受影响。')
+-          return { kind: 'reply', text: lines.join('\n') }
+-        } catch (error) {
+-          // **失败必须说出来**：宿主拒绝时若照常回一句"已切换"，用户会以为生效了。
+-          const reason = error instanceof Error ? error.message : String(error)
+-          return { kind: 'reply', text: `切换模型没有成功：${reason}\n\n发「/model」看清单。` }
+-        }
++        return await this.#doSelectModel(binding, target)
+       }
+ 
+       case '/current': {
+@@ -540,6 +519,25 @@ export class SessionRouter {
+     const currentId = bindings[params.conversationId]?.sessionId
+     const now = Date.now()
+ 
++    if (position.level === 'models') {
++      const binding = bindings[params.conversationId]
++      if (binding === undefined) return undefined
++      const models = (await this.#gateway.listModels?.()) ?? []
++      const current = await this.#gateway.currentModel?.(binding.sessionId)
++      const asked = parseModelCommand(text)
++      if (asked.levelForm) {
++        return await this.#selectLevel(binding, models, current, asked)
++      }
++      const target = resolveModel(text, models)
++      if (target === undefined) {
++        this.#diagnose(
++          `browse: 模型选择「${text}」没匹配上（清单里有 ${String(models.length)} 个）`,
++        )
++        return undefined
++      }
++      return await this.#doSelectModel(binding, target)
++    }
++
+     if (position.level === 'folders') {
+       const folders = this.#folders(all)
+       if (isShowRest(text)) {
+@@ -806,6 +804,35 @@ export class SessionRouter {
+     }
+   }
+ 
++  /**
++   * 执行模型切换。
++   *
++   * @param binding - 会话绑定。
++   * @param target - 解析出的目标模型。
++   */
++  async #doSelectModel(binding, target) {
++    if (this.#gateway.selectModel === undefined) {
++      return { kind: 'reply', text: '当前组合不支持切换模型。' }
++    }
++    try {
++      const selected = await this.#gateway.selectModel(
++        binding.sessionId,
++        target.provider,
++        target.model,
++        target.defaultLevel,
++      )
++      const name = modelLabel(selected ?? target)
++      const label = levelName(selected?.reasoningEffort, target.levels ?? [])
++      const lines = [`已切换模型：${name}。`]
++      if (label !== undefined) lines.push(`推理等级：${label}`)
++      lines.push('', '对下一步生效，正在跑的那一步不受影响。')
++      return { kind: 'reply', text: lines.join('\n') }
++    } catch (error) {
++      const reason = error instanceof Error ? error.message : String(error)
++      return { kind: 'reply', text: `切换模型没有成功：${reason}\n\n发「/model」看清单。` }
++    }
++  }
++
+   /**
+    * 创建一个绑定、它的会话，并持久化。
+    *
+@@ -855,6 +882,26 @@ export class SessionRouter {
+     return this.#bindings
+   }
+ 
++  /**
++   * 丢掉绑定缓存，让下一次 `#load()` 重新读盘。
++   *
++   * ## 为什么必须有这个口子
++   *
++   * `#load()` 的 `??=` 让绑定**只读一次**就永久缓存。本文件内的指令都走
++   * `#store.save(bindings)`，所以缓存与磁盘一致；但 `/run` 是**运行时**直接
++   * 用 `#store.update()` 改绑定的——那条路绕过了本类。
++   *
++   * 于是出现了一个真实故障：`/run 1` 切过去之后，`/list` 与 `/current`
++   * 仍然报**原来那个会话**（缓存里的旧值），而消息其实已经发到新会话了。
++   * 用户看到的是"切了但没切"，两边说的不是一回事。
++   *
++   * 所以运行时改完绑定必须调一次这里。名字直白是有意的：
++   * 它不做别的，就是"下次重新读"。
++   */
++  invalidateBindings() {
++    this.#bindings = undefined
++  }
++
+   /**
+    * 一条绑定绑着的会话是不是已经收不了活，因此必须被换掉。
+    *
+@@ -2286,8 +2333,16 @@ export const HELP_TEXT = [
+   '/model 等级 <等级>  切换当前模型的推理等级',
+   '/current         显示当前对话',
+   '/cancel          中断当前任务',
++  '/notify [on|off] 任何会话结束都推送到 QQ（不带参数看当前状态）',
++  '/run             看正在跑、还没完成的任务（跑得久的在前）',
+   '/help            显示本帮助',
+   '',
++  '111 你的问题      发到「快速对话目录」的最新会话，当前对话不受影响',
++  '/111 你的问题     把字面量「111 你的问题」发给当前对话',
++  'rrr 你的话        回话给最近跑完任务的那个会话，当前对话不受影响',
++  '/rrr 你的话       把字面量「rrr 你的话」发给当前对话',
++  '//i              转义：把 /i 这类 DSH 命令交给 agent（如 //i 开 ADHD 模式）',
++  '',
+   `每屏最多 ${String(BROWSE_PAGE_SIZE)} 条，编号跨屏连续；回复「${SHOW_REST}」看下十个。`,
+   '列表就在眼前时，直接回编号、名字或行尾 id 即可，不必打 /switch。',
+   '',

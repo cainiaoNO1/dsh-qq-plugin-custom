@@ -1,0 +1,209 @@
+# 改造 3,9,10 | 文件: client.js
+# 基线: dsh-qq-plugin@1.0.3
+warning: in the working copy of 'C:/Users/yuanmingjie/AppData/Local/Temp/upstream-qq/package/client.js', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'C:/Users/yuanmingjie/.dsh/profiles/web/node_modules/dsh-qq-plugin/client.js', LF will be replaced by CRLF the next time Git touches it
+diff --git a/client.js b/client.js
+index 56e21b7..cfbdbbf 100644
+--- a/client.js
++++ b/client.js
+@@ -82,12 +82,16 @@ const HANDBOOK_URL = 'https://github.com/xcisxc29/dsh-qq-plugin/blob/main/docs/H
+ const SETTINGS_FIELDS = [
+   'requireConfirmation',
+   'allowCrossSessionNotify',
++  'notifyAllSessions',
+   'settleMs',
+   'presenceNote',
+   'mergeWindowMs',
+   'autoReplyAttachments',
+   'maxReplyChars',
+   'workspacePath',
++  'quickWorkspacePath',
++  'markdownMode',
++  'finishPromptChars',
+ ]
+ 
+ /**
+@@ -319,6 +323,21 @@ window.__ModuleLoader__.load({
+         allowCrossSessionNotify: '允许其他会话推送到 QQ',
+         allowCrossSessionNotifyHint:
+           '开启后，任何会话都能主动发消息或文件到 QQ——包括你正在电脑上干活、它做完后通知你的情况。关掉则只有 QQ 对话自己那个会话能发。',
++        notifyAllSessions: '任何会话结束都推送结果',
++        notifyAllSessionsHint:
++          '开启后，电脑上任何会话跑完都会把最终结果发到 QQ，不用先切进去。过程旁白不会推。也可以在 QQ 里用 /notify on 切换。',
++        quickWorkspacePath: '快速对话目录',
++        quickWorkspacePathHint:
++          '填了这个目录后，在 QQ 里发「111 你的问题」就会把问题发到这个目录的最新会话，当前对话不受影响。留空则不启用，111 会被当成普通文字。',
++        markdownMode: '回复里的 Markdown 格式',
++        markdownModeHint:
++          'QQ 消息不渲染 Markdown，原样发出去是一堆井号和星号。转纯文本最易读；转文件能保留排版但要点开。',
++        markdownModePlain: '转成纯文本（推荐）',
++        markdownModeRaw: '原样发送',
++        markdownModeFile: '有格式就发 .md 文件',
++        finishPromptChars: '完成推送里的提问字数上限',
++        finishPromptCharsHint:
++          '会话跑完推送到 QQ 时，开头会带上你当时的提问。超过这个字数就截断加省略号。填 0 表示不显示提问。',
+         settleMs: '回复聚合静默窗口（毫秒）',
+         settleMsHint: '间隔小于这个值就合并成一条。调大更完整但更慢，调小更快但可能拆成多条。',
+         mergeWindowMs: '附件合并窗口（毫秒）',
+@@ -424,6 +443,21 @@ window.__ModuleLoader__.load({
+         allowCrossSessionNotify: 'Let other sessions push to QQ',
+         allowCrossSessionNotifyHint:
+           'On, any session may send you a message or a file — which is how a task that finishes while you are away can still reach you. Off, only the session the QQ conversation is bound to may send.',
++        notifyAllSessions: 'Push the result of every finished session',
++        notifyAllSessionsHint:
++          'On, any session on this computer sends its final result to QQ when it finishes — no need to switch into it first. Process narration is not pushed. You can also toggle it from QQ with /notify on.',
++        quickWorkspacePath: 'Quick-chat folder',
++        quickWorkspacePathHint:
++          'With a folder set, sending «111 your question» in QQ delivers it to the newest session in that folder without touching the current conversation. Leave it empty to disable: 111 is then ordinary text.',
++        markdownMode: 'Markdown in replies',
++        markdownModeHint:
++          'QQ does not render Markdown, so raw output arrives as hash marks and asterisks. Plain text is the most readable; a file keeps the layout but must be opened.',
++        markdownModePlain: 'Convert to plain text (recommended)',
++        markdownModeRaw: 'Send as-is',
++        markdownModeFile: 'Send a .md file when formatted',
++        finishPromptChars: 'Question length in finish pushes',
++        finishPromptCharsHint:
++          'When a session finishes, the push to QQ starts with what you asked. Longer than this is cut with an ellipsis. 0 hides the question.',
+         settleMs: 'Reply merge window (ms)',
+         settleMsHint:
+           'Gaps smaller than this merge into one message. Larger is more complete but slower; smaller is faster but may split.',
+@@ -997,6 +1031,19 @@ a.dsh-qq-button { text-decoration: none; }
+             body: JSON.stringify(patch),
+           })
+           const saved = isRecord(result) && isRecord(result.settings) ? result.settings : state.draft
++          /*
++           * 宿主不认识的字段名（页面比宿主新时会出现）。
++           *
++           * 这类字段**根本不在 `saved` 里**，所以 `ignoredSettings` 的比较对它无效——
++           * 那一步比的是"发出去的和存下来的差在哪"，而一个被整体忽略的键在两边都没有。
++           * 真实故障：旧宿主收到 `quickWorkspacePath` 时静默丢掉，页面照旧显示「已保存」，
++           * 用户以为设置好了，实际上 `111` 一直按普通文本处理。
++           * 所以这里把它并进同一条提示里。
++           */
++          const unknownFromHost =
++            isRecord(result) && Array.isArray(result.unknown)
++              ? result.unknown.filter((key) => typeof key === 'string')
++              : []
+           setState((prev) => ({
+             ...prev,
+             busy: false,
+@@ -1004,7 +1051,12 @@ a.dsh-qq-button { text-decoration: none; }
+             // A save is only reported as a success if every value sent is the value stored. The
+             // host silently drops a field it cannot accept, and 已保存 over a dropped field is how a
+             // user comes to believe a setting is in effect when it never was.
+-            ignored: ignoredSettings(patch, saved, t),
++            ignored: [
++              ...new Set([
++                ...ignoredSettings(patch, saved, t),
++                ...unknownFromHost.map((key) => (typeof t[key] === 'string' ? t[key] : key)),
++              ]),
++            ],
+             settings: saved,
+             draft: saved,
+             defaults: isRecord(result) && isRecord(result.defaults) ? result.defaults : prev.defaults,
+@@ -1139,13 +1191,13 @@ a.dsh-qq-button { text-decoration: none; }
+        *   next to the field — with the host's own words, because "选择文件夹失败" alone cannot tell a
+        *   permission problem from a missing service.
+        */
+-      async function chooseWorkspacePath() {
++      async function chooseWorkspacePath(field = 'workspacePath') {
+         const pick = props?.pick
+         if (typeof pick !== 'function') return
+         setState((prev) => ({ ...prev, pickBusy: true, pickError: '' }))
+         try {
+           const chosen = await pick()
+-          if (typeof chosen === 'string') edit('workspacePath', chosen)
++          if (typeof chosen === 'string') edit(field, chosen)
+           setState((prev) => ({ ...prev, pickBusy: false }))
+         } catch (error) {
+           console.error('dsh-qq: 选择文件夹失败', error)
+@@ -1578,6 +1630,23 @@ a.dsh-qq-button { text-decoration: none; }
+                     }),
+                   ),
+ 
++                  h(
++                    'div',
++                    { className: 'dsh-qq-row' },
++                    h(
++                      'div',
++                      { className: 'dsh-qq-row-text' },
++                      h('label', null, t.notifyAllSessions),
++                      h('span', { className: 'dsh-qq-hint' }, t.notifyAllSessionsHint),
++                    ),
++                    h(Toggle, {
++                      checked: draft.notifyAllSessions === true,
++                      label: t.notifyAllSessions,
++                      disabled: state.busy,
++                      onChange: (next) => edit('notifyAllSessions', next),
++                    }),
++                  ),
++
+                   h(
+                     'div',
+                     { className: 'dsh-qq-row' },
+@@ -1723,6 +1792,65 @@ a.dsh-qq-button { text-decoration: none; }
+                     ),
+                   ),
+ 
++                  field(
++                    t.quickWorkspacePath,
++                    t.quickWorkspacePathHint,
++                    h(
++                      'div',
++                      { className: 'dsh-qq-path-row' },
++                      h('input', {
++                        type: 'text',
++                        className: 'dsh-qq-input',
++                        value:
++                          typeof draft.quickWorkspacePath === 'string' ? draft.quickWorkspacePath : '',
++                        onChange: (event) => edit('quickWorkspacePath', event.target.value),
++                      }),
++                      canPick
++                        ? h(
++                            'button',
++                            {
++                              type: 'button',
++                              className: 'dsh-qq-button dsh-qq-outline',
++                              disabled: state.pickBusy || state.busy,
++                              onClick: () => void chooseWorkspacePath('quickWorkspacePath'),
++                            },
++                            t.workspacePathPick,
++                          )
++                        : null,
++                    ),
++                  ),
++
++                  field(
++                    t.markdownMode,
++                    t.markdownModeHint,
++                    h(
++                      'select',
++                      {
++                        className: 'dsh-qq-input',
++                        value:
++                          typeof draft.markdownMode === 'string' ? draft.markdownMode : 'plain',
++                        onChange: (event) => edit('markdownMode', event.target.value),
++                      },
++                      h('option', { value: 'plain' }, t.markdownModePlain),
++                      h('option', { value: 'raw' }, t.markdownModeRaw),
++                      h('option', { value: 'file' }, t.markdownModeFile),
++                    ),
++                  ),
++
++                  field(
++                    t.finishPromptChars,
++                    t.finishPromptCharsHint,
++                    h('input', {
++                      type: 'number',
++                      min: 0,
++                      className: 'dsh-qq-input',
++                      value: Number.isFinite(draft.finishPromptChars)
++                        ? draft.finishPromptChars
++                        : 60,
++                      onChange: (event) => editNumber('finishPromptChars', event.target.value),
++                    }),
++                  ),
++
+                   h(
+                     'div',
+                     { className: 'dsh-qq-actions' },

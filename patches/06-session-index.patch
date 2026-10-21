@@ -1,0 +1,85 @@
+# 改造 7 | 文件: lib/session-index.js
+# 基线: dsh-qq-plugin@1.0.3
+warning: in the working copy of 'C:/Users/yuanmingjie/AppData/Local/Temp/upstream-qq/package/lib/session-index.js', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'C:/Users/yuanmingjie/.dsh/profiles/web/node_modules/dsh-qq-plugin/lib/session-index.js', LF will be replaced by CRLF the next time Git touches it
+diff --git a/lib/session-index.js b/lib/session-index.js
+index 7530d00..ce892ed 100644
+--- a/lib/session-index.js
++++ b/lib/session-index.js
+@@ -123,16 +123,25 @@ async function readIndex(storeDir, sessionId) {
+       const parsed = JSON.parse(raw)
+       const title = parsed.record?.rows?.title?.val
+       const cwd = parsed.record?.identity?.cwd
++      const turns = parsed.record?.rows?.turnOutline?.val?.turns
++      const lastTurn = Array.isArray(turns) && turns.length > 0 ? turns.at(-1) : undefined
++      const lastPrompt = typeof lastTurn?.prompt === 'string' ? lastTurn.prompt.trim() : ''
++      const lastPromptAt = parsed.record?.rows?.sessionListMetadata?.val?.lastPromptAt
+       return {
+         title: typeof title === 'string' ? title : '',
+         cwd: typeof cwd === 'string' ? cwd : '',
+         updatedAt: recordedSessionTime(parsed),
++        lastPrompt,
++        lastPromptAt:
++          typeof lastPromptAt === 'number' && Number.isFinite(lastPromptAt) && lastPromptAt > 0
++            ? lastPromptAt
++            : undefined,
+       }
+     } catch {
+       // 试下一个拼法。
+     }
+   }
+-  return { title: '', cwd: '', updatedAt: 0 }
++  return { title: '', cwd: '', updatedAt: 0, lastPrompt: '', lastPromptAt: undefined }
+ }
+ 
+ /**
+@@ -199,7 +208,14 @@ export async function listStoredSessions(home, workspace) {
+       const index = await readIndex(indexDir, sessionId)
+       // 文件夹名是有损编码，所以只有当会话自己的记录说它属于这里时才提供它。
+       if (index.cwd !== '' && !isSameWorkspace(index.cwd, workspace)) continue
+-      sessions.push({ sessionId, title: index.title, updatedAt: index.updatedAt, cwd: index.cwd })
++      sessions.push({
++        sessionId,
++        title: index.title,
++        updatedAt: index.updatedAt,
++        cwd: index.cwd,
++        lastPrompt: index.lastPrompt,
++        lastPromptAt: index.lastPromptAt,
++      })
+     }
+   }
+   return sessions.sort(compareSessionsNewestFirst)
+@@ -225,7 +241,14 @@ export async function listAllStoredSessions(home) {
+       const index = await readIndex(indexDir, sessionId)
+       // 按记录分组，而不是按文件夹：文件夹名有损，会把无关目录并到一起。
+       const key = index.cwd
+-      const entry = { sessionId, title: index.title, updatedAt: index.updatedAt, cwd: index.cwd }
++      const entry = {
++        sessionId,
++        title: index.title,
++        updatedAt: index.updatedAt,
++        cwd: index.cwd,
++        lastPrompt: index.lastPrompt,
++        lastPromptAt: index.lastPromptAt,
++      }
+       const list = byWorkspace.get(key)
+       if (list === undefined) byWorkspace.set(key, [entry])
+       else list.push(entry)
+@@ -250,6 +273,17 @@ export async function storedSessionWorkspace(home, sessionId) {
+   return index.cwd === '' ? undefined : index.cwd
+ }
+ 
++/**
++ * 读一条会话的详细索引信息（标题、工作目录、最近提问文本与时间戳）。
++ *
++ * @param home - DSH 主目录。
++ * @param sessionId - 目标会话。
++ * @returns `{ title, cwd, updatedAt, lastPrompt, lastPromptAt }`。
++ */
++export async function readStoredSessionDetails(home, sessionId) {
++  return await readIndex(join(home, 'storages', 'session_projcache', 'sessions'), sessionId)
++}
++
+ /**
+  * 存储里到底有没有这条会话的记录，读得懂读不懂都算。
+  *
