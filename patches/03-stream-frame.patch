@@ -1,7 +1,3 @@
-# 改造 1 | 文件: lib/stream-frame.js
-# 基线: dsh-qq-plugin@1.0.3
-warning: in the working copy of 'C:/Users/yuanmingjie/AppData/Local/Temp/upstream-qq/package/lib/stream-frame.js', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'C:/Users/yuanmingjie/.dsh/profiles/web/node_modules/dsh-qq-plugin/lib/stream-frame.js', LF will be replaced by CRLF the next time Git touches it
 diff --git a/lib/stream-frame.js b/lib/stream-frame.js
 index da70245..51c851e 100644
 --- a/lib/stream-frame.js

@@ -1,9 +1,5 @@
-# 改造 1,2,3,4,5,6,7,8,9,12 | 文件: lib/runtime.js
-# 基线: dsh-qq-plugin@1.0.3
-warning: in the working copy of 'C:/Users/yuanmingjie/AppData/Local/Temp/upstream-qq/package/lib/runtime.js', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'C:/Users/yuanmingjie/.dsh/profiles/web/node_modules/dsh-qq-plugin/lib/runtime.js', LF will be replaced by CRLF the next time Git touches it
 diff --git a/lib/runtime.js b/lib/runtime.js
-index cb9b59e..662ca0f 100644
+index cb9b59e..915714b 100644
 --- a/lib/runtime.js
 +++ b/lib/runtime.js
 @@ -41,8 +41,9 @@ import {
@@ -792,7 +788,7 @@ index cb9b59e..662ca0f 100644
          return
        }
        entry.timer = setTimeout(() => {
-@@ -1836,54 +2432,1382 @@ export class QqRuntime {
+@@ -1836,54 +2432,1411 @@ export class QqRuntime {
      })
    }
  
@@ -2011,17 +2007,38 @@ index cb9b59e..662ca0f 100644
 +      /*
 +       * 推送内容 = 提问 + 分隔线 + 结果。
 +       *
-+       * 只发结果的话，用户看到"完成了"却想不起问的是什么——尤其在同时跑好几个
-+       * 任务的时候。提问取本插件记下的**用户原话**（`#runningSince`），
-+       * 截到 `finishPromptChars` 字，超过加省略号。
-+       *
-+       * 提问拿不到时（插件启动前就在跑）只发结果，**不编一个占位符**：
-+       * 一句"（提问未知）"对用户没有任何信息量，只会占掉三行。
++       * 1. 提问支持桌面端会话兜底：若 #runningSince 没记录（桌面端会话），
++       *    退回读磁盘投影详情（`readStoredSessionDetails`）。
++       * 2. 结果支持 Markdown 处理（降级文件 / 转纯文本）：
++       *    若 markdownMode 为 plain（默认），转为纯文本发消息，
++       *    避免手机 QQ 出现大量 raw markdown（###、**、- 等）。
++       *    超长（超过 maxReplyChars）或 markdownMode 为 file 时自动转为 .md 附件。
 +       */
-+      const question = this.#finishedQuestion(sessionId)
-+      const body =
-+        question === '' ? finalText : `${question}\n${FINISH_SEPARATOR}\n${finalText}`
-+      await this.#deliverOrQueue(conversationId, { text: body })
++      const question = await this.#finishedQuestion(sessionId)
++
++      const plan = planReply(finalText, this.#settings.maxReplyChars)
++      if (plan.kind === 'file') {
++        const caption =
++          question === '' ? plan.caption : `${question}\n${FINISH_SEPARATOR}\n${plan.caption}`
++        await this.#deliverOrQueue(conversationId, { text: caption })
++        await this.#sendMarkdownFile(conversationId, plan.text)
++      } else {
++        const rendered = this.#renderForQq(plan.text)
++        if (rendered === undefined) {
++          // markdownMode === 'file' 且含 markdown
++          const caption =
++            question === ''
++              ? '回复含格式，已作为 .md 文件发送。'
++              : `${question}\n${FINISH_SEPARATOR}\n回复含格式，已作为 .md 文件发送。`
++          await this.#deliverOrQueue(conversationId, { text: caption })
++          await this.#sendMarkdownFile(conversationId, plan.text)
++        } else {
++          const body =
++            question === '' ? rendered : `${question}\n${FINISH_SEPARATOR}\n${rendered}`
++          await this.#deliverOrQueue(conversationId, { text: body })
++        }
++      }
++
 +      /*
 +       * 记下"刚跑完的是谁"，供 `rrr` 回话。
 +       *
@@ -2041,15 +2058,23 @@ index cb9b59e..662ca0f 100644
 +   * 取出某个会话**这一轮**的提问，压成推送里那一行。
 +   *
 +   * 来源是 `#runningSince`（本插件在提交提示词时记的用户原话）。
-+   * 拿不到就返回空串——调用方据此只发结果，不编占位符。
++   * 桌面端开的会话拿不到时，退回读磁盘索引（`readStoredSessionDetails`）。
++   * 都拿不到就返回空串——调用方据此只发结果，不编占位符。
 +   *
 +   * @param sessionId - 刚收尾的会话。
 +   * @returns 一行提问，可能为空串。
 +   */
-+  #finishedQuestion(sessionId) {
++  async #finishedQuestion(sessionId) {
 +    const tracked = this.#runningSince.get(sessionId)
-+    if (tracked === undefined) return ''
-+    return clipQuestion(tracked.prompt, this.#settings.finishPromptChars)
++    let prompt = tracked?.prompt
++    if (!prompt) {
++      try {
++        const details = await readStoredSessionDetails(this.#home, sessionId)
++        prompt = details?.lastPrompt || details?.title
++      } catch {}
++    }
++    if (!prompt) return ''
++    return clipQuestion(prompt, this.#settings.finishPromptChars)
 +  }
 +
 +  /**
@@ -2206,3 +2231,16 @@ index cb9b59e..662ca0f 100644
      }
    }
  
+@@ -2599,7 +4552,11 @@ export class QqRuntime {
+       throw new Error('当前没有绑定任何 QQ 对话，无法推送。请让用户在 QQ 里先发一条消息。')
+     }
+     // 发不出去就排队——用户等的那条通知不该凭空消失。
+-    return await this.#deliverOrQueue(conversationId, { text, path })
++    const deliverText =
++      this.#settings.markdownMode === 'plain' && hasMarkdown(text)
++        ? markdownToPlain(text)
++        : text
++    return await this.#deliverOrQueue(conversationId, { text: deliverText, path })
+   }
+ 
+   /**

@@ -1,8 +1,8 @@
-﻿# 把 build\ 部署到 DSH 插件目录
+# 把当前仓库的自用改造版代码部署到 DSH 插件目录
 #
 # 用法:
-#   .\tools\deploy.ps1                # 部署 build/ 到插件目录
-#   .\tools\deploy.ps1 -DryRun        # 只看会改哪些文件
+#   .\tools\deploy.ps1                # 部署到插件目录
+#   .\tools\deploy.ps1 -DryRun        # 仅预览会改哪些文件
 param(
   [string]$Profile = "web",
   [switch]$DryRun
@@ -10,18 +10,14 @@ param(
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
-$build = Join-Path $root "build"
-
-if (-not (Test-Path $build)) {
-  throw "找不到 build\ —— 先跑 .\tools\apply.ps1"
-}
+$srcRoot = $root
 
 $dest = Join-Path $env:USERPROFILE ".dsh\profiles\$Profile\node_modules\dsh-qq-plugin"
 if (-not (Test-Path $dest)) {
   throw "找不到插件目录: $dest"
 }
 
-Write-Host "源:      $build"
+Write-Host "源:      $srcRoot"
 Write-Host "目标:    $dest"
 Write-Host ""
 
@@ -32,7 +28,7 @@ $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 
 foreach ($f in @("client.js","lib\runtime.js","lib\router.js","lib\stream-frame.js",
                  "lib\settings.js","lib\state.js","lib\session-index.js","lib\plain-text.js")) {
-  $src = Join-Path $build ($f -replace '/','\')
+  $src = Join-Path $srcRoot ($f -replace '/','\')
   $dst = Join-Path $dest ($f -replace '/','\')
   if (-not (Test-Path $src)) { Write-Host "跳过（源缺失）: $f" -ForegroundColor DarkGray; continue }
 
@@ -42,12 +38,14 @@ foreach ($f in @("client.js","lib\runtime.js","lib\router.js","lib\stream-frame.
     continue
   }
 
-  # 备份现有文件（只备份一次，带时间戳）
+  # 备份现有文件（带时间戳）
   if (Test-Path $dst) {
     $bak = Join-Path $backup ("$($stamp)-" + ($f -replace '[\\/]','-') + ".bak")
     Copy-Item $dst $bak -Force
   }
   Copy-Item $src $dst -Force
+  Write-Host "已更新 $f" -ForegroundColor Green
+}
   Write-Host "已更新 $f" -ForegroundColor Green
 }
 

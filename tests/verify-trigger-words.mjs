@@ -8,15 +8,11 @@
  */
 
 import { pathToFileURL } from 'node:url'
-// 可移植：优先用 build\（补丁应用后的产物），回退到本机已部署的插件。
-const { existsSync } = await import('node:fs')
+// 统一指向本仓库根目录的插件源码
 const { join, dirname } = await import('node:path')
 const { fileURLToPath } = await import('node:url')
 const here = dirname(fileURLToPath(import.meta.url))
-const buildDir = join(here, '..', 'build')
-const PLUGIN = existsSync(buildDir)
-  ? buildDir.replace(/\\/g, '/')
-  : join(process.env.USERPROFILE ?? '', '.dsh/profiles/web/node_modules/dsh-qq-plugin').replace(/\\/g, '/')
+const PLUGIN = join(here, '..').replace(/\\/g, '/')
 
 // 从 runtime.js 源码里取出 extractTriggerWord 的逻辑做行为验证。
 // 该函数不导出（模块内部使用），所以这里按同一份实现复刻并用真实输入核对。

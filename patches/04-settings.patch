@@ -1,7 +1,3 @@
-# 改造 3,6,10 | 文件: lib/settings.js
-# 基线: dsh-qq-plugin@1.0.3
-warning: in the working copy of 'C:/Users/yuanmingjie/AppData/Local/Temp/upstream-qq/package/lib/settings.js', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'C:/Users/yuanmingjie/.dsh/profiles/web/node_modules/dsh-qq-plugin/lib/settings.js', LF will be replaced by CRLF the next time Git touches it
 diff --git a/lib/settings.js b/lib/settings.js
 index 51314a8..7155f9e 100644
 --- a/lib/settings.js

@@ -1,7 +1,3 @@
-# 改造 4,11,12 | 文件: lib/router.js
-# 基线: dsh-qq-plugin@1.0.3
-warning: in the working copy of 'C:/Users/yuanmingjie/AppData/Local/Temp/upstream-qq/package/lib/router.js', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'C:/Users/yuanmingjie/.dsh/profiles/web/node_modules/dsh-qq-plugin/lib/router.js', LF will be replaced by CRLF the next time Git touches it
 diff --git a/lib/router.js b/lib/router.js
 index 55c77c9..23df3ff 100644
 --- a/lib/router.js
