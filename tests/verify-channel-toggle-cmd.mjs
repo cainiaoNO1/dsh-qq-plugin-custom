@@ -116,5 +116,89 @@ check('用户设了 true，重启依然开启', resolveEnabledOnBoot(true, true)
 check('用户从未设置过，默认跟随 config 为 true', resolveEnabledOnBoot(undefined, true), true)
 check('用户从未设置过，config 为 false 则为 false', resolveEnabledOnBoot(undefined, false), false)
 
+// ---- 4. 通道关闭期间待发消息丢弃与排队拦截验证 ----
+class DeliveryChannel {
+  constructor(initialEnabled = true) {
+    this.enabled = initialEnabled
+    this.pendingQueue = []
+    this.sentToQq = []
+  }
+
+  setEnabled(enabled) {
+    this.enabled = enabled
+    if (!enabled) {
+      this.pendingQueue = []
+    }
+  }
+
+  deliverOrQueue(text) {
+    if (!this.enabled) {
+      // 关闭期间直接丢弃，不发送也不排队
+      return 'QQ 通道当前处于关闭状态，消息已丢弃'
+    }
+    // 假设正常状态下因窗口未打开而排队
+    this.pendingQueue.push(text)
+    return '文本已排队'
+  }
+
+  handleInbound(text) {
+    const isStartCmd = /^(?:\/|\/\/)?start$/i.test(text)
+    const isStopCmd = /^(?:\/|\/\/)?stop$/i.test(text)
+
+    if (isStartCmd) {
+      this.setEnabled(true)
+      this.sentToQq.push('QQ 通道已开启。')
+      return
+    }
+    if (isStopCmd) {
+      this.setEnabled(false)
+      this.sentToQq.push('QQ 通道已关闭。')
+      return
+    }
+    if (!this.enabled) {
+      this.sentToQq.push('QQ 通道当前处于关闭状态')
+      return
+    }
+
+    // 通道开启且非控制命令：补发待发
+    while (this.pendingQueue.length > 0) {
+      this.sentToQq.push(`[补发] ${this.pendingQueue.shift()}`)
+    }
+    this.sentToQq.push(`[回复] 回答: ${text}`)
+  }
+}
+
+{
+  const dc = new DeliveryChannel(true)
+  // 正常开启时有一条排队消息
+  dc.deliverOrQueue('任务A完成')
+  check('开启时消息入队', dc.pendingQueue.length, 1)
+
+  // 用户关闭通道
+  dc.handleInbound('/stop')
+  check('关闭通道后历史待发队列被清空', dc.pendingQueue.length, 0)
+
+  // 通道关闭期间，电脑上有多个任务完成尝试推送
+  const res1 = dc.deliverOrQueue('任务B完成')
+  const res2 = dc.deliverOrQueue('任务C完成')
+  check('关闭期间投递被拒绝1', res1, 'QQ 通道当前处于关闭状态，消息已丢弃')
+  check('关闭期间投递被拒绝2', res2, 'QQ 通道当前处于关闭状态，消息已丢弃')
+  check('关闭期间待发队列依然为空', dc.pendingQueue.length, 0)
+
+  // 关闭期间用户在 QQ 发消息，被拦截且不补发
+  dc.handleInbound('随便问一句')
+  check('关闭期间消息被拦截', dc.sentToQq[dc.sentToQq.length - 1], 'QQ 通道当前处于关闭状态')
+  check('未发生任何补发', dc.sentToQq.some(m => m.includes('任务B') || m.includes('任务C')), false)
+
+  // 用户发送 /start 重新开启
+  dc.handleInbound('/start')
+  check('通道重新开启', dc.enabled, true)
+
+  // 重新开启后，用户在 QQ 发送第一次普通消息
+  dc.handleInbound('现在能用了吗')
+  check('正常收到回复', dc.sentToQq[dc.sentToQq.length - 1], '[回复] 回答: 现在能用了吗')
+  check('开启后的第一次消息绝不包含关闭期间的消息', dc.sentToQq.some(m => m.includes('任务B') || m.includes('任务C') || m.includes('任务A')), false)
+}
+
 console.log(`\n通过 ${pass} / 失败 ${fail}`)
 process.exit(fail === 0 ? 0 : 1)

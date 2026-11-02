@@ -211,6 +211,17 @@ xxx
 
 ---
 
+### 改造 18：通道关闭期间消息丢弃与防积压补发
+
+**问题**：通道关闭后，桌面端会话结束（notifyAllSessions）或主动工具调用（notify_qq）在发送失败时仍会被推入待发队列（`pendingNotifications`）；当通道重新开启并收到用户第一条消息时，会将关闭期间积压的消息全量补发。
+
+**修法**：
+- 通道关闭状态下（`!isChannelEnabled()`），`#deliverOrQueue`、`#forwardUnbound`、`#flushReply`、`notifyFromTool` 直接丢弃消息，不入待发队列、不发送。
+- 通道切换为关闭时（`setEnabled(false)` 或 `/stop`），自动清空历史待发队列（`delete next.pendingNotifications`）与运行中暂存回复。
+- `#flushPending` 仅在通道开启且非开关控制指令时执行，确保通道关闭期间的消息任何时候都不会补发到 QQ。
+
+---
+
 ## 三、设置项总表
 
 | 设置 | 默认 | 来源 |
