@@ -3,3 +3,8 @@
 /conflicts/
 node_modules/
 
+# GitHub Token & Local Env
+.env
+.env.*
+.github_token
+.token
