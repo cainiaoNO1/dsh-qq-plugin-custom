@@ -116,12 +116,10 @@ export function apply(ctx, config = {}) {
 
       void (async () => {
         try {
-          if (await runtime.enabled(config.autoStart)) {
-            await runtime.start()
-            bootLog('apply: 渠道已启动')
-          } else {
-            bootLog('apply: autoStart 未开启，等待手动启动')
-          }
+          // 始终启动底层监听，以支持在 QQ 随时发送 /start 唤醒开启
+          await runtime.start()
+          const isEnabled = await runtime.isChannelEnabled()
+          bootLog(`apply: 渠道已挂载，通道状态=${isEnabled ? '开启' : '关闭（待命，发送 /start 可随时开启）'}`)
         } catch (error) {
           bootLog(`apply: 启动失败 ${describeError(error)}`)
         }

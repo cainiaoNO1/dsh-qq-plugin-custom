@@ -316,8 +316,8 @@ window.__ModuleLoader__.load({
          * (`runtime.js` reads them per message and `#switchWorkspace` runs on the spot), so the
          * second half stays; what was missing is the click.
          */
-        settingsHint: '改完点「保存设置」。这里所有设置都立即生效，不用重启。',
-        settingsDirty: '有改动还没保存。',
+        settingsHint: '设置修改后自动保存并立即生效，无需手动保存。',
+        settingsDirty: '',
         requireConfirmation: '会话操作先确认',
         requireConfirmationHint: '你说「换个对话」这类要求时，DSH 会先说它要做什么，等你同意再执行。',
         allowCrossSessionNotify: '允许其他会话推送到 QQ',
@@ -435,8 +435,8 @@ window.__ModuleLoader__.load({
         saveFailed: 'Could not save',
         saveIgnored: 'The host did not accept these values, so they were put back to what is in effect:',
         settingsTitle: 'Behaviour',
-        settingsHint: 'Press « Save » after a change. Everything here takes effect at once; no restart.',
-        settingsDirty: 'Changes are not saved yet.',
+        settingsHint: 'Settings are saved automatically and take effect at once.',
+        settingsDirty: '',
         requireConfirmation: 'Confirm before acting on a request',
         requireConfirmationHint:
           'When you ask for something like «switch conversation», DSH first says what it will do and waits for you to agree.',
@@ -981,15 +981,15 @@ a.dsh-qq-button { text-decoration: none; }
       /**
        * Turn the channel on or off.
        *
-       * QQ has no single toggle route: `/start` and `/stop` are the pair, and both answer with the
-       * same status snapshot `GET /status` returns, so the switch needs no follow-up read.
+       * Calls `/toggle` to persist `autoStart: connected` to state.json,
+       * so restarting dsh web remembers the user's explicit preference.
        */
       async function toggle(connected) {
         setState((prev) => ({ ...prev, busy: true, error: '' }))
         try {
-          const snapshot = await request(connected ? `${PREFIX}/start` : `${PREFIX}/stop`, {
+          const snapshot = await request(`${PREFIX}/toggle`, {
             method: 'POST',
-            body: '{}',
+            body: JSON.stringify({ enabled: connected }),
           })
           setState((prev) => ({
             ...prev,
@@ -1005,75 +1005,58 @@ a.dsh-qq-button { text-decoration: none; }
         }
       }
 
-      /**
-       * Wait for a saved settings answer, then fold it back in.
-       *
-       * The reply is compared against what was sent, field by field, before the page claims success.
-       * `lib/settings.js` drops a value it cannot accept — out of range, wrong type — and keeps the
-       * old one, so the reply is the only place that drop is visible; without the comparison the page
-       * prints 已保存 over a field that never moved.
-       *
-       * A host that omits `settings` in the reply leaves the draft as the truth, which is what the
-       * page already showed — the alternative would be to blank the form on a successful save.
-       */
-      async function saveSettings() {
-        if (state.draft === undefined) return
-        // The patch built below is what the host is asked for; it is kept for the comparison.
-        const patch = {}
-        for (const key of SETTINGS_FIELDS) {
-          // Only the fields this page owns go back: see SETTINGS_FIELDS.
-          if (key in state.draft) patch[key] = state.draft[key]
+      const debounceTimerRef = React.useRef(null)
+
+      /** 自动保存指定的一个或多个设置字段。 */
+      async function savePatch(patchToSave) {
+        if (debounceTimerRef.current) {
+          clearTimeout(debounceTimerRef.current)
+          debounceTimerRef.current = null
         }
-        setState((prev) => ({ ...prev, busy: true, saved: false, saveError: '', ignored: [] }))
+        if (!isRecord(patchToSave) || Object.keys(patchToSave).length === 0) return
+        setState((prev) => ({ ...prev, saved: false, saveError: '', ignored: [] }))
         try {
           const result = await request(`${PREFIX}/settings`, {
             method: 'POST',
-            body: JSON.stringify(patch),
+            body: JSON.stringify(patchToSave),
           })
-          const saved = isRecord(result) && isRecord(result.settings) ? result.settings : state.draft
-          /*
-           * 宿主不认识的字段名（页面比宿主新时会出现）。
-           *
-           * 这类字段**根本不在 `saved` 里**，所以 `ignoredSettings` 的比较对它无效——
-           * 那一步比的是"发出去的和存下来的差在哪"，而一个被整体忽略的键在两边都没有。
-           * 真实故障：旧宿主收到 `quickWorkspacePath` 时静默丢掉，页面照旧显示「已保存」，
-           * 用户以为设置好了，实际上 `111` 一直按普通文本处理。
-           * 所以这里把它并进同一条提示里。
-           */
+          const saved = isRecord(result) && isRecord(result.settings) ? result.settings : patchToSave
           const unknownFromHost =
             isRecord(result) && Array.isArray(result.unknown)
               ? result.unknown.filter((key) => typeof key === 'string')
               : []
           setState((prev) => ({
             ...prev,
-            busy: false,
             saved: true,
-            // A save is only reported as a success if every value sent is the value stored. The
-            // host silently drops a field it cannot accept, and 已保存 over a dropped field is how a
-            // user comes to believe a setting is in effect when it never was.
             ignored: [
               ...new Set([
-                ...ignoredSettings(patch, saved, t),
+                ...ignoredSettings(patchToSave, saved, t),
                 ...unknownFromHost.map((key) => (typeof t[key] === 'string' ? t[key] : key)),
               ]),
             ],
             settings: saved,
-            draft: saved,
+            draft: { ...(prev.draft ?? {}), ...saved },
             defaults: isRecord(result) && isRecord(result.defaults) ? result.defaults : prev.defaults,
           }))
-          // The confirmation is transient: it describes one save, not a state of the form. Whatever
-          // was ignored is a state and stays on screen.
-          setTimeout(() => setState((prev) => ({ ...prev, saved: false })), 2500)
+          setTimeout(() => setState((prev) => ({ ...prev, saved: false })), 2000)
         } catch (error) {
-          // Reported to the host as well as shown: a failing save is exactly the case where a static
-          // page and a stale state file look the same from the outside.
           reportFailure('save', error)
           setState((prev) => ({
             ...prev,
-            busy: false,
             saveError: error instanceof Error ? error.message : String(error),
           }))
         }
+      }
+
+      /** 防抖自动保存（输入框停顿 400ms 后自动提交）。 */
+      function scheduleDebouncedSave(patchToSave) {
+        if (debounceTimerRef.current) {
+          clearTimeout(debounceTimerRef.current)
+        }
+        debounceTimerRef.current = setTimeout(() => {
+          debounceTimerRef.current = null
+          void savePatch(patchToSave)
+        }, 400)
       }
 
       /**
@@ -1154,42 +1137,27 @@ a.dsh-qq-button { text-decoration: none; }
         )
       }
 
-      /** Patch one draft field, leaving the rest of the form alone. */
-      function edit(key, value) {
+      /** Patch one draft field and trigger auto-save. */
+      function edit(key, value, options = {}) {
         setState((prev) => ({ ...prev, draft: { ...(prev.draft ?? {}), [key]: value } }))
+        if (options.immediate) {
+          void savePatch({ [key]: value })
+        } else {
+          scheduleDebouncedSave({ [key]: value })
+        }
       }
 
       /**
        * Patch one numeric draft field from the input's raw string.
-       *
-       * `0` is a legal setting for both numeric fields this page owns — no waiting, no limit — so it
-       * is never folded away as "empty", and neither is an empty input, which keeps the same meaning
-       * the hint gives it. Negative input is clamped to 0 rather than sent: the host drops a
-       * negative value silently, so posting one would look like the edit was ignored.
        */
-      function editNumber(key, raw) {
+      function editNumber(key, raw, options = {}) {
         const value = Number(raw)
-        edit(key, Number.isFinite(value) ? Math.max(0, value) : 0)
+        const normalized = Number.isFinite(value) ? Math.max(0, value) : 0
+        edit(key, normalized, options)
       }
 
       /**
        * Ask the system for a folder and put the answer in the path field.
-       *
-       * Three outcomes, and they are discriminated deliberately:
-       *
-       * - a **string** is written through `edit('workspacePath', …)`, exactly as typing would,
-       *   so the chooser and the keyboard end at the same state. The string is written **as it
-       *   arrived**: not trimmed, no separator added or removed, no escaping. What counts as a
-       *   path is the host's decision (`lib/paths.js` `resolveWorkspaceDir`), and repairing it
-       *   here would make the chosen value differ from the typed one for no reason.
-       * - **`null`** — and any other non-string, since `undefined` is not a choice either — means
-       *   the user closed the dialog. Nothing happens at all: the field keeps its old value, no
-       *   error appears, no state is written. Cancelling must not be destructive.
-       * - a **throw** is caught. It must be: an error that escapes a slot component replaces the
-       *   whole entry with one `slot entry crashed in 'settings.section'` line and the page is
-       *   gone. The failure is reported to the host log, printed to the console, and also shown
-       *   next to the field — with the host's own words, because "选择文件夹失败" alone cannot tell a
-       *   permission problem from a missing service.
        */
       async function chooseWorkspacePath(field = 'workspacePath') {
         const pick = props?.pick
@@ -1197,7 +1165,7 @@ a.dsh-qq-button { text-decoration: none; }
         setState((prev) => ({ ...prev, pickBusy: true, pickError: '' }))
         try {
           const chosen = await pick()
-          if (typeof chosen === 'string') edit(field, chosen)
+          if (typeof chosen === 'string') edit(field, chosen, { immediate: true })
           setState((prev) => ({ ...prev, pickBusy: false }))
         } catch (error) {
           console.error('dsh-qq: 选择文件夹失败', error)
@@ -1396,7 +1364,7 @@ a.dsh-qq-button { text-decoration: none; }
                   h('span', { className: 'dsh-qq-hint' }, t.enabledHint),
                 ),
                 h(Toggle, {
-                  checked: status.connected === true,
+                  checked: status.enabled !== false,
                   label: t.enabled,
                   disabled: state.busy,
                   onChange: (next) => void toggle(next),
@@ -1626,7 +1594,7 @@ a.dsh-qq-button { text-decoration: none; }
                       checked: draft.allowCrossSessionNotify === true,
                       label: t.allowCrossSessionNotify,
                       disabled: state.busy,
-                      onChange: (next) => edit('allowCrossSessionNotify', next),
+                      onChange: (next) => edit('allowCrossSessionNotify', next, { immediate: true }),
                     }),
                   ),
 
@@ -1643,7 +1611,7 @@ a.dsh-qq-button { text-decoration: none; }
                       checked: draft.notifyAllSessions === true,
                       label: t.notifyAllSessions,
                       disabled: state.busy,
-                      onChange: (next) => edit('notifyAllSessions', next),
+                      onChange: (next) => edit('notifyAllSessions', next, { immediate: true }),
                     }),
                   ),
 
@@ -1660,7 +1628,7 @@ a.dsh-qq-button { text-decoration: none; }
                       checked: draft.requireConfirmation === true,
                       label: t.requireConfirmation,
                       disabled: state.busy,
-                      onChange: (next) => edit('requireConfirmation', next),
+                      onChange: (next) => edit('requireConfirmation', next, { immediate: true }),
                     }),
                   ),
 
@@ -1673,6 +1641,7 @@ a.dsh-qq-button { text-decoration: none; }
                       className: 'dsh-qq-input',
                       value: Number.isFinite(draft.mergeWindowMs) ? draft.mergeWindowMs : 0,
                       onChange: (event) => editNumber('mergeWindowMs', event.target.value),
+                      onBlur: (event) => editNumber('mergeWindowMs', event.target.value, { immediate: true }),
                     }),
                   ),
 
@@ -1691,7 +1660,7 @@ a.dsh-qq-button { text-decoration: none; }
                       checked: draft.autoReplyAttachments !== false,
                       label: t.autoReplyAttachments,
                       disabled: state.busy,
-                      onChange: (next) => edit('autoReplyAttachments', next),
+                      onChange: (next) => edit('autoReplyAttachments', next, { immediate: true }),
                     }),
                   ),
 
@@ -1706,6 +1675,7 @@ a.dsh-qq-button { text-decoration: none; }
                       className: 'dsh-qq-input',
                       value: Number.isFinite(draft.maxReplyChars) ? draft.maxReplyChars : 0,
                       onChange: (event) => editNumber('maxReplyChars', event.target.value),
+                      onBlur: (event) => editNumber('maxReplyChars', event.target.value, { immediate: true }),
                     }),
                   ),
 
@@ -1718,6 +1688,7 @@ a.dsh-qq-button { text-decoration: none; }
                       className: 'dsh-qq-input',
                       value: Number.isFinite(draft.settleMs) ? draft.settleMs : 0,
                       onChange: (event) => edit('settleMs', Number(event.target.value)),
+                      onBlur: (event) => edit('settleMs', Number(event.target.value), { immediate: true }),
                     }),
                   ),
 
@@ -1734,6 +1705,7 @@ a.dsh-qq-button { text-decoration: none; }
                       rows: 5,
                       value: typeof draft.presenceNote === 'string' ? draft.presenceNote : '',
                       onChange: (event) => edit('presenceNote', event.target.value),
+                      onBlur: (event) => edit('presenceNote', event.target.value, { immediate: true }),
                     }),
                   ),
 
@@ -1771,6 +1743,7 @@ a.dsh-qq-button { text-decoration: none; }
                         className: 'dsh-qq-input',
                         value: typeof draft.workspacePath === 'string' ? draft.workspacePath : '',
                         onChange: (event) => edit('workspacePath', event.target.value),
+                        onBlur: (event) => edit('workspacePath', event.target.value, { immediate: true }),
                       }),
                       canPick
                         ? h(
@@ -1804,6 +1777,7 @@ a.dsh-qq-button { text-decoration: none; }
                         value:
                           typeof draft.quickWorkspacePath === 'string' ? draft.quickWorkspacePath : '',
                         onChange: (event) => edit('quickWorkspacePath', event.target.value),
+                        onBlur: (event) => edit('quickWorkspacePath', event.target.value, { immediate: true }),
                       }),
                       canPick
                         ? h(
@@ -1829,7 +1803,7 @@ a.dsh-qq-button { text-decoration: none; }
                         className: 'dsh-qq-input',
                         value:
                           typeof draft.markdownMode === 'string' ? draft.markdownMode : 'plain',
-                        onChange: (event) => edit('markdownMode', event.target.value),
+                        onChange: (event) => edit('markdownMode', event.target.value, { immediate: true }),
                       },
                       h('option', { value: 'plain' }, t.markdownModePlain),
                       h('option', { value: 'raw' }, t.markdownModeRaw),
@@ -1848,6 +1822,7 @@ a.dsh-qq-button { text-decoration: none; }
                         ? draft.finishPromptChars
                         : 60,
                       onChange: (event) => editNumber('finishPromptChars', event.target.value),
+                      onBlur: (event) => editNumber('finishPromptChars', event.target.value, { immediate: true }),
                     }),
                   ),
 
@@ -1858,44 +1833,18 @@ a.dsh-qq-button { text-decoration: none; }
                       'button',
                       {
                         type: 'button',
-                        className: 'dsh-qq-button dsh-qq-primary',
-                        disabled: state.busy,
-                        onClick: () => void saveSettings(),
-                      },
-                      t.settingsSave,
-                    ),
-                    /*
-                     * The only reset on the page.
-                     *
-                     * It puts every field back to the host's own defaults at once, by replacing the
-                     * draft with `defaults` — the values the host reports, not a copy kept here. The
-                     * per-field reset links that used to sit beside each label are gone: they were an
-                     * invention of this page, they doubled the amount of text on every row, and one
-                     * button that undoes everything is what the equivalent page offers.
-                     */
-                    h(
-                      'button',
-                      {
-                        type: 'button',
                         className: 'dsh-qq-button dsh-qq-outline',
                         disabled: state.busy || state.defaults === undefined,
-                        // Resetting fills the form from the defaults and saves nothing, so the notes
-                        // an earlier save left are about a draft that no longer exists.
-                        onClick: () =>
-                          setState((prev) => ({ ...prev, draft: prev.defaults, ignored: [] })),
+                        onClick: () => {
+                          if (state.defaults) {
+                            setState((prev) => ({ ...prev, draft: prev.defaults, ignored: [] }))
+                            void savePatch(state.defaults)
+                          }
+                        },
                       },
                       t.settingsReset,
                     ),
                     state.saved ? h('span', { className: 'dsh-qq-ok' }, t.settingsSaved) : null,
-                    /*
-                     * The page is edited without being saved, and a filled box looks exactly like a
-                     * stored value. This is the one thing that tells the two apart — its absence used
-                     * to be read, reasonably, as "already saved".
-                     */
-                    draftIsDirty(state)
-                      ? h('span', { className: 'dsh-qq-warn' }, t.settingsDirty)
-                      : null,
-
                     /*
                      * What happened to the save, said next to the button that started it.
                      *

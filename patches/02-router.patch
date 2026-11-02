@@ -1,5 +1,5 @@
 diff --git a/lib/router.js b/lib/router.js
-index 55c77c9..23df3ff 100644
+index 55c77c9..b20d533 100644
 --- a/lib/router.js
 +++ b/lib/router.js
 @@ -458,7 +458,11 @@ export class SessionRouter {
@@ -138,10 +138,12 @@ index 55c77c9..23df3ff 100644
    /**
     * 一条绑定绑着的会话是不是已经收不了活，因此必须被换掉。
     *
-@@ -2286,8 +2333,16 @@ export const HELP_TEXT = [
+@@ -2286,8 +2333,18 @@ export const HELP_TEXT = [
    '/model 等级 <等级>  切换当前模型的推理等级',
    '/current         显示当前对话',
    '/cancel          中断当前任务',
++  '/start           开启 QQ 遥控通道',
++  '/stop            关闭 QQ 遥控通道（随时发送 /start 重新开启）',
 +  '/notify [on|off] 任何会话结束都推送到 QQ（不带参数看当前状态）',
 +  '/run             看正在跑、还没完成的任务（跑得久的在前）',
    '/help            显示本帮助',
@@ -155,3 +157,4 @@ index 55c77c9..23df3ff 100644
    `每屏最多 ${String(BROWSE_PAGE_SIZE)} 条，编号跨屏连续；回复「${SHOW_REST}」看下十个。`,
    '列表就在眼前时，直接回编号、名字或行尾 id 即可，不必打 /switch。',
    '',
+
