@@ -1,3 +1,5 @@
-﻿# 补丁应用产物，每次由 tools\apply.ps1 重新生成
+# 补丁应用产物，每次由 tools\apply.ps1 重新生成
 /build/
 /conflicts/
+node_modules/
+
