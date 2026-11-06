@@ -222,6 +222,17 @@ xxx
 
 ---
 
+### 改造 19：兼容纯 UUID 命名的会话与 `rrr` 存活检测修复
+
+**问题**：现代 DSH 的会话目录很多直接以 36 位 UUID 命名（如 `01a13dbc-c9d2-7a71-b68c-166dd6b8f0ca`），而插件源码硬编码了 `.filter((name) => name.startsWith('session-'))`，导致这些会话在 `listSessions()` 中被直接过滤丢弃。用户使用 `rrr` 追问时被误判为「那个会话已经不在了，rrr 发不出去」，且标题丢失为纯 ID。
+
+**修法**：
+- 在 `lib/session-index.js` 中新增 `isSessionDir(name)`，同时放行 `session-` 开头及合法 36 位 UUID 的目录；
+- 在 `lib/runtime.js` 的 `rrr` 存活检查中，使用 `hasStoredSession(home, target.sessionId)` 作为真实物理存活判定依据；
+- 在 `rememberFinished` 中为标题增加投影缓存兜底读取，避免会话标题显示为空。
+
+---
+
 ## 三、设置项总表
 
 | 设置 | 默认 | 来源 |

@@ -1,5 +1,5 @@
 diff --git a/lib/session-index.js b/lib/session-index.js
-index 7530d00..ce892ed 100644
+index 7530d00..4b9c183 100644
 --- a/lib/session-index.js
 +++ b/lib/session-index.js
 @@ -123,16 +123,25 @@ async function readIndex(storeDir, sessionId) {
@@ -29,7 +29,29 @@ index 7530d00..ce892ed 100644
  }
  
  /**
-@@ -199,7 +208,14 @@ export async function listStoredSessions(home, workspace) {
+@@ -178,6 +187,15 @@ async function listDirs(root) {
+   }
+ }
+ 
++/** 判断是否是合法会话目录名：支持传统的 session-<uuid>，也支持现代 DSH 直接以 UUID 命名的会话。 */
++export function isSessionDir(name) {
++  return (
++    typeof name === 'string' &&
++    (name.startsWith('session-') ||
++      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(name))
++  )
++}
++
+ /**
+  * 列出属于**某一个工作区**的会话，最新的在前。
+  *
+@@ -194,12 +212,19 @@ export async function listStoredSessions(home, workspace) {
+ 
+   const sessions = []
+   for (const folder of wanted) {
+-    const ids = (await listDirs(join(sessionsRoot, folder))).filter((name) => name.startsWith('session-'))
++    const ids = (await listDirs(join(sessionsRoot, folder))).filter(isSessionDir)
+     for (const sessionId of ids) {
        const index = await readIndex(indexDir, sessionId)
        // 文件夹名是有损编码，所以只有当会话自己的记录说它属于这里时才提供它。
        if (index.cwd !== '' && !isSameWorkspace(index.cwd, workspace)) continue
@@ -45,7 +67,13 @@ index 7530d00..ce892ed 100644
      }
    }
    return sessions.sort(compareSessionsNewestFirst)
-@@ -225,7 +241,14 @@ export async function listAllStoredSessions(home) {
+@@ -220,12 +245,19 @@ export async function listAllStoredSessions(home) {
+ 
+   const byWorkspace = new Map()
+   for (const folder of await listDirs(sessionsRoot)) {
+-    const ids = (await listDirs(join(sessionsRoot, folder))).filter((name) => name.startsWith('session-'))
++    const ids = (await listDirs(join(sessionsRoot, folder))).filter(isSessionDir)
+     for (const sessionId of ids) {
        const index = await readIndex(indexDir, sessionId)
        // 按记录分组，而不是按文件夹：文件夹名有损，会把无关目录并到一起。
        const key = index.cwd
@@ -61,7 +89,7 @@ index 7530d00..ce892ed 100644
        const list = byWorkspace.get(key)
        if (list === undefined) byWorkspace.set(key, [entry])
        else list.push(entry)
-@@ -250,6 +273,17 @@ export async function storedSessionWorkspace(home, sessionId) {
+@@ -250,6 +282,17 @@ export async function storedSessionWorkspace(home, sessionId) {
    return index.cwd === '' ? undefined : index.cwd
  }
  
@@ -79,3 +107,4 @@ index 7530d00..ce892ed 100644
  /**
   * 存储里到底有没有这条会话的记录，读得懂读不懂都算。
   *
+

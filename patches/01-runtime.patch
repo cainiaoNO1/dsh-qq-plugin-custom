@@ -1,5 +1,5 @@
 diff --git a/lib/runtime.js b/lib/runtime.js
-index cb9b59e..99a63bc 100644
+index cb9b59e..7144293 100644
 --- a/lib/runtime.js
 +++ b/lib/runtime.js
 @@ -41,8 +41,9 @@ import {
@@ -394,7 +394,19 @@ index cb9b59e..99a63bc 100644
    }
  
    /**
-@@ -1127,10 +1425,7 @@ export class QqRuntime {
+@@ -1005,7 +1303,10 @@ export class QqRuntime {
+        * 与插件自己的日志共用一份时间线。
+        */
+       logger: {
+-        info: (message) => bootLog(`sdk info  ${message}`),
++        info: (message) => {
++          if (typeof message === 'string' && message.includes('[qqbot:api]')) return
++          bootLog(`sdk info  ${message}`)
++        },
+         warn: (message) => bootLog(`sdk warn  ${message}`),
+         error: (message) => bootLog(`sdk error ${message}`),
+       },
+@@ -1127,19 +1428,26 @@ export class QqRuntime {
    }
  
    /**
@@ -406,9 +418,12 @@ index cb9b59e..99a63bc 100644
     *
     * @param enabled - 目标状态。
     */
-@@ -1138,8 +1433,11 @@ export class QqRuntime {
+   async setEnabled(enabled) {
      await this.#store.update((next) => {
        next.autoStart = enabled
++      if (!enabled) {
++        delete next.pendingNotifications
++      }
      })
 -    if (enabled) await this.start()
 -    else await this.halt()
@@ -416,17 +431,24 @@ index cb9b59e..99a63bc 100644
 +    if (this.#bot === undefined) {
 +      await this.start()
 +    }
++    if (!enabled) {
++      this.#replies.clear()
++      this.#unboundReplies.clear()
++    }
 +    bootLog(`通道业务状态已切换为: ${enabled ? '开启' : '关闭'}`)
      return await this.status()
    }
  
-@@ -1223,6 +1521,49 @@ export class QqRuntime {
-        */
-       await this.#flushPending(conversationId)
+@@ -1215,11 +1523,51 @@ export class QqRuntime {
+       const attachments = message.attachments ?? []
  
-+      /*
+       /*
+-       * 用户说话了 → 窗口重新打开 → **先补发积压的待发消息**，再处理这条。
 +       * ★ 通道开关远程控制指令（/start 与 /stop）：
-+       *
+        *
+-       * 顺序是有意的（微信的注释）：用户自己的消息才是"重新打开窗口"的东西，
+-       * 所以积压的通知属于这条回答**之前**——否则用户等着的通知会出现在
+-       * 一条毫不相干的回复下面，看起来像是答非所问。
 +       * 无论设置里的开关是什么状态，用户都可以随时通过 QQ 发送 /start 或 /stop 远程切换。
 +       * 且在通道关闭状态下，拦截所有其他消息（不执行任务，不调用 agent），
 +       * 并友好回复引导提示，直到收到 /start 唤醒。
@@ -467,10 +489,13 @@ index cb9b59e..99a63bc 100644
 +        return
 +      }
 +
-       /*
-        * 带附件的消息先**停靠**，不立刻投递。
-        *
-@@ -1245,7 +1586,7 @@ export class QqRuntime {
++      /*
++       * 用户说话了 → 窗口重新打开 → **先补发积压的待发消息**，再处理这条。
++       * 只有通道正常开启且不是通道控制指令时，才补发待发消息。
+        */
+       await this.#flushPending(conversationId)
+ 
+@@ -1245,7 +1593,7 @@ export class QqRuntime {
         * 它看起来不是指令，会整条落进 agent 那一支。
         * `composed`（带引用的原形态）留给交互拦截与交付，那两条路一个字都不变。
         */
@@ -479,7 +504,7 @@ index cb9b59e..99a63bc 100644
        /*
         * 只引用、什么都没写也是一条消息（交给 agent 时就是那句引用），不该被丢掉。
         *
-@@ -1305,8 +1646,127 @@ export class QqRuntime {
+@@ -1305,8 +1653,127 @@ export class QqRuntime {
     *
     * @param params.quoted - 被引用消息的正文；只交给路由（它靠它认出被引的那一屏清单），
     *   交付给 agent 时按原来的顺序拼回正文之前。
@@ -608,7 +633,7 @@ index cb9b59e..99a63bc 100644
      // 交给路由：它要么直接回一句（指令），要么给出该交给哪个会话的提示词。
      // 与微信插件同构——`/new` `/list` `/switch` `/current` `/cancel` `/help` 都在路由里实现，
      // 本运行时只负责传输。
-@@ -1327,6 +1787,13 @@ export class QqRuntime {
+@@ -1327,6 +1794,13 @@ export class QqRuntime {
         */
        if (await this.#send(conversationId, routed.text)) {
          await this.#router.delivered(conversationId, routed)
@@ -622,7 +647,7 @@ index cb9b59e..99a63bc 100644
        }
        return
      }
-@@ -1379,6 +1846,35 @@ export class QqRuntime {
+@@ -1379,6 +1853,35 @@ export class QqRuntime {
  
      const outbound = composeDelivery({ promptText, attachmentLines, note })
  
@@ -658,7 +683,7 @@ index cb9b59e..99a63bc 100644
      let accepted = false
      for (const part of outbound) {
        // 被拒的 steer 是一个真实结果（它瞄准的那个回合可能刚好结束），所以退到队列再试，
-@@ -1401,6 +1897,27 @@ export class QqRuntime {
+@@ -1401,6 +1904,27 @@ export class QqRuntime {
        )
        // 消息是这里唯一不可重建的东西，绝不能丢。
        await this.#send(conversationId, `没能把消息交给会话，请重发一次。\n\n你的内容：\n${text}`)
@@ -686,7 +711,7 @@ index cb9b59e..99a63bc 100644
      }
    }
  
-@@ -1472,6 +1989,17 @@ export class QqRuntime {
+@@ -1472,6 +1996,17 @@ export class QqRuntime {
        peerId: parked.peerId,
        text,
        attachmentLines: lines,
@@ -704,7 +729,7 @@ index cb9b59e..99a63bc 100644
      })
    }
  
-@@ -1558,9 +2086,14 @@ export class QqRuntime {
+@@ -1558,9 +2093,14 @@ export class QqRuntime {
     * "经本频道创建的会话"里，其它会话一选就失败。
     *
     * @param sessionId - 目标会话。
@@ -721,7 +746,7 @@ index cb9b59e..99a63bc 100644
      const path = stored ?? this.#workspace
      const own = isSameWorkspace(path, this.#workspace)
      const workspaceId = await this.#workspaceIdFor(path, own ? WORKSPACE_TITLE : '')
-@@ -1708,6 +2241,7 @@ export class QqRuntime {
+@@ -1708,6 +2248,7 @@ export class QqRuntime {
            { content, requestId: `qq-${randomUUID()}`, sessionId, mode },
            signal,
          )
@@ -729,7 +754,7 @@ index cb9b59e..99a63bc 100644
          return true
        } catch (error) {
          // 带上会话 id：微信那批修复的第四条就是"提交失败没带会话 id"，
-@@ -1721,6 +2255,7 @@ export class QqRuntime {
+@@ -1721,6 +2262,7 @@ export class QqRuntime {
          { content, requestId: `qq-${randomUUID()}`, sessionId, mode: 'steer' },
          signal,
        )
@@ -737,7 +762,7 @@ index cb9b59e..99a63bc 100644
        return true
      } catch (error) {
        bootLog(`steer 被拒，退回 queue: ${describeError(error)}`)
-@@ -1730,6 +2265,7 @@ export class QqRuntime {
+@@ -1730,6 +2272,7 @@ export class QqRuntime {
          { content, requestId: `qq-${randomUUID()}`, sessionId, mode: 'queue' },
          signal,
        )
@@ -745,7 +770,7 @@ index cb9b59e..99a63bc 100644
        return true
      } catch (error) {
        this.#recordError(`排队提交也失败: session=${sessionId} ${describeError(error)}`)
-@@ -1737,6 +2273,34 @@ export class QqRuntime {
+@@ -1737,6 +2280,34 @@ export class QqRuntime {
      }
    }
  
@@ -780,7 +805,7 @@ index cb9b59e..99a63bc 100644
    // ---------------------------------------------------------------- 出站
  
    /**
-@@ -1791,7 +2355,24 @@ export class QqRuntime {
+@@ -1791,7 +2362,24 @@ export class QqRuntime {
        recordOnce(this.#seen, `#frameShapes:${frameShape}`, `未知帧形态（宿主可能改了事件词汇）: ${frameShape}`)
      }
  
@@ -806,7 +831,7 @@ index cb9b59e..99a63bc 100644
  
      this.#fire('回复聚合', async () => {
        const state = await this.#store.read()
-@@ -1807,6 +2388,23 @@ export class QqRuntime {
+@@ -1807,6 +2395,24 @@ export class QqRuntime {
         * （`recordOnce`），既留下痕迹又不把日志刷爆。
         */
        if (conversationId === undefined) {
@@ -824,13 +849,14 @@ index cb9b59e..99a63bc 100644
 +         * - 走 `#deliverOrQueue`：发不出去就排队，用户等的那条结果不该凭空消失。
 +         */
 +        if (this.#settings.notifyAllSessions === true) {
++          if (!(await this.isChannelEnabled())) return
 +          await this.#forwardUnbound(sessionId, { text, completed, toolCall })
 +          return
 +        }
          recordOnce(
            this.#seen,
            `#unboundStreams:${sessionId}`,
-@@ -1818,14 +2416,61 @@ export class QqRuntime {
+@@ -1818,14 +2424,61 @@ export class QqRuntime {
  
        const existing = this.#replies.get(sessionId)
        if (existing !== undefined) clearTimeout(existing.timer)
@@ -895,7 +921,7 @@ index cb9b59e..99a63bc 100644
          return
        }
        entry.timer = setTimeout(() => {
-@@ -1836,54 +2481,1411 @@ export class QqRuntime {
+@@ -1836,27 +2489,1354 @@ export class QqRuntime {
      })
    }
  
@@ -957,11 +983,7 @@ index cb9b59e..99a63bc 100644
 +   * `sessionController.list()` 的每一项带 `running` 字段
 +   * （`dsh-api-session-controller` 的 `summaryFor`：`agents.get(id)?.status === 'running'`）。
 +   * 那是宿主自己维护的实时状态，比自己记账可靠。
-    *
--   * @param conversationId - 对话键。
--   * @param text - 已 trim 的回复正文。
--   */
--  async #sendReply(conversationId, text) {
++   *
 +   * ## 拿不到时怎么办
 +   *
 +   * 服务不存在、或这条会话不在清单里（还没被创建过），一律当**不忙**。
@@ -1334,13 +1356,14 @@ index cb9b59e..99a63bc 100644
 +    }
 +
 +    /*
-+     * 会话可能已经被删掉或归档。先确认它还在宿主的清单里——
++     * 会话可能已经被删掉或归档。先确认它还在磁盘或宿主清单里——
 +     * 直接 prompt 一条不存在的会话会抛，而用户看到的会是一句莫名其妙的错误。
 +     */
 +    let alive = true
 +    try {
++      const existsOnDisk = await hasStoredSession(this.#home, target.sessionId)
 +      const all = await this.#gateway().listSessions()
-+      alive = all.some((row) => row.sessionId === target.sessionId)
++      alive = existsOnDisk || all.some((row) => row.sessionId === target.sessionId)
 +    } catch {
 +      // 查不到就当它还活着：让下面那次提交给出真实答案，而不是这里猜。
 +      alive = true
@@ -2049,6 +2072,10 @@ index cb9b59e..99a63bc 100644
 +   * @param frame.toolCall - 本帧的工具调用（有则证明还在干活）。
 +   */
 +  async #forwardUnbound(sessionId, { text, completed, toolCall }) {
++    if (!(await this.isChannelEnabled())) {
++      this.#unboundReplies.delete(sessionId)
++      return
++    }
 +    const existing = this.#unboundReplies.get(sessionId)
 +    const entry = existing ?? { text: '', sawTool: false, narrationLen: 0, pushed: false }
 +    if (text !== undefined) entry.text += text
@@ -2204,6 +2231,14 @@ index cb9b59e..99a63bc 100644
 +    } catch {
 +      // 取标题失败不影响 `rrr`：目标由 sessionId 决定。
 +    }
++    if (title === '') {
++      try {
++        const details = await readStoredSessionDetails(this.#home, sessionId)
++        if (typeof details?.title === 'string' && details.title.trim() !== '') {
++          title = details.title.trim()
++        }
++      } catch {}
++    }
 +    try {
 +      await this.#store.update((next) => {
 +        next.lastFinished = { sessionId, title, at: Date.now() }
@@ -2221,6 +2256,10 @@ index cb9b59e..99a63bc 100644
 +   *   省略时发整个缓冲区。
 +   */
 +  async #flushReply(sessionId, overrideText) {
++    if (!(await this.isChannelEnabled())) {
++      this.#replies.delete(sessionId)
++      return
++    }
 +    const entry = this.#replies.get(sessionId)
 +    // 没有缓冲（别处已经发过 / 定时器与回合结束撞在一起）**不是丢东西**：
 +    // 下面那个 `text === ''` 同理——两处都无事可做，所以刻意不记日志。
@@ -2250,11 +2289,11 @@ index cb9b59e..99a63bc 100644
 +   *
 +   * 微信的原话同样适用：先给一句 caption，**免得文件变成一个没有说明的附件**。
 +   * 文件写进媒体目录，所以用户在电脑上也能找到它。
-+   *
-+   * @param conversationId - 对话键。
-+   * @param text - 已 trim 的回复正文。
-+   */
-+  async #sendReply(conversationId, text) {
+    *
+    * @param conversationId - 对话键。
+    * @param text - 已 trim 的回复正文。
+@@ -1864,26 +3844,73 @@ export class QqRuntime {
+   async #sendReply(conversationId, text) {
      const plan = planReply(text, this.#settings.maxReplyChars)
      if (plan.kind === 'send') {
 -      await this.#send(conversationId, plan.text)
@@ -2335,7 +2374,18 @@ index cb9b59e..99a63bc 100644
      }
    }
  
-@@ -2599,7 +4601,11 @@ export class QqRuntime {
+@@ -2568,6 +4595,10 @@ export class QqRuntime {
+    * @returns 一句人话结果。
+    */
+   async notifyFromTool(args, exec) {
++    if (!(await this.isChannelEnabled())) {
++      bootLog('notify_qq: 通道处于关闭状态，消息已丢弃')
++      return 'QQ 通道当前处于关闭状态，消息已丢弃。'
++    }
+     const text = typeof args?.text === 'string' ? args.text : ''
+     const path = typeof args?.path === 'string' ? args.path.trim() : ''
+     if (text.trim() === '' && path === '') {
+@@ -2599,7 +4630,11 @@ export class QqRuntime {
        throw new Error('当前没有绑定任何 QQ 对话，无法推送。请让用户在 QQ 里先发一条消息。')
      }
      // 发不出去就排队——用户等的那条通知不该凭空消失。
@@ -2348,7 +2398,38 @@ index cb9b59e..99a63bc 100644
    }
  
    /**
-@@ -2852,6 +4858,7 @@ export class QqRuntime {
+@@ -2661,6 +4696,11 @@ export class QqRuntime {
+    * @returns 一句人话结果。
+    */
+   async #deliverOrQueue(conversationId, { text, path }) {
++    if (!(await this.isChannelEnabled())) {
++      bootLog(`通道处于关闭状态，丢弃待发消息，不发送也不排队: conversation=${conversationId}`)
++      return 'QQ 通道当前处于关闭状态，消息已丢弃'
++    }
++
+     const done = []
+     const queued = []
+ 
+@@ -2691,6 +4731,10 @@ export class QqRuntime {
+ 
+   /** 入队一条待发消息。入队失败**必须抛出**：那意味着这条消息彻底没救了。 */
+   async #queuePending(conversationId, { text, path }) {
++    if (!(await this.isChannelEnabled())) {
++      bootLog(`通道处于关闭状态，拒绝待发入队: conversation=${conversationId}`)
++      return
++    }
+     let dropped = 0
+     await this.#store.update((state) => {
+       dropped = queuePendingNotification(state, {
+@@ -2721,6 +4765,7 @@ export class QqRuntime {
+    */
+   async #flushPending(conversationId) {
+     try {
++      if (!(await this.isChannelEnabled())) return
+       // 先过期、再读。反过来的话，刚被判定为过期的东西会被读进这次循环里照样发出去。
+       let expired = 0
+       await this.#store.update((state) => {
+@@ -2852,6 +4897,7 @@ export class QqRuntime {
      const account = state.accounts[this.#appId]
      return {
        connected: this.connected,
